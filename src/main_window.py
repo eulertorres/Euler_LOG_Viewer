@@ -360,7 +360,7 @@ class TelemetryApp(QMainWindow):
             self.mapWidget.setHtml("<html><body><h1>Mas num tem dado GPS meu filho!!.</h1></body></html>"); return
         coords = self.df[['Latitude', 'Longitude']].dropna().values.tolist()
         if not coords:
-            self.mapWidget.setHtml("<html><body><h1>WTF e essas Coordenadas GPS?? kkkkk</h1></body></html>"); return
+            self.mapWidget.setHtml("<html><body><h1>Mas num tem dado GPS meu filho!! kkkkk</h1></body></html>"); return
 
         # --- Cria o mapa base ---
         map_center = self.df[['Latitude', 'Longitude']].mean().values.tolist()

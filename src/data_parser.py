@@ -184,7 +184,7 @@ signal_name_map = {
 
 def parse_spi_log_via_c(file_path):
     """
-    Chama o decoder C externo, captura sua saída JSON (stdout),
+    Chama o decoder C externo, captura saída JSON (stdout),
     e transforma em um DataFrame Pandas unificado.
     """
     # --- Configuração ---
@@ -192,25 +192,25 @@ def parse_spi_log_via_c(file_path):
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(script_dir)
-        decoder_exe_path = os.path.join(project_root, "decoder.exe")
+        decoder_exe_path = os.path.join(project_root, "src", "decoder.exe")
         if not os.path.exists(decoder_exe_path):
             decoder_exe_path = os.path.abspath("decoder.exe")
             if not os.path.exists(decoder_exe_path):
-                 print(f"ERRO: Executável C 'decoder.exe' não encontrado!")
+                 print(f"ERRO: Uaaai, cade o 'decoder.exe'?? DEVOLVE")
                  return pd.DataFrame()
     except Exception as e:
-         print(f"ERRO ao determinar caminho do decoder.exe: {e}")
+         print(f"Esse caminho do decoder.exe ta zuadasso: {e}")
          return pd.DataFrame()
 
     if not os.path.exists(file_path):
-        print(f"ERRO: Arquivo spi.log '{file_path}' não encontrado!")
+        print(f"Meu querido, num tem spi.log no '{file_path}' nao!")
         return pd.DataFrame()
 
     # --- Execução do Subprocesso ---
     stdout_data = ""
     stderr_data = ""
     try:
-        print(f"DEBUG: Executando decoder C: {decoder_exe_path} \"{file_path}\"")
+        #print(f"DEBUG: Executando decoder C: {decoder_exe_path} \"{file_path}\"")
         process = subprocess.Popen(
             [decoder_exe_path, file_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -234,15 +234,15 @@ def parse_spi_log_via_c(file_path):
     # --- Processamento da Saída JSON ---
     parsed_data = []
     lines = stdout_data.strip().split('\n')
-    print(f"DEBUG: Decoder C produziu {len(lines)} linhas JSON.")
+    #print(f"DEBUG: Decoder C produziu {len(lines)} linhas JSON.")
     for i, line in enumerate(lines):
         line = line.strip();
         if not line: continue
         try:
             packet = json.loads(line)
             if 'timestamp' in packet: parsed_data.append(packet)
-        except json.JSONDecodeError as e: print(f"ERRO parse JSON linha {i+1}: {e}\nLinha: '{line}'"); continue
-    if not parsed_data: print("AVISO: Nenhum pacote JSON válido com timestamp."); return pd.DataFrame()
+        except json.JSONDecodeError as e: print(f"Deu erroooo na linha {i+1}: {e}\nLinha: '{line}'"); continue
+    if not parsed_data: print("AVISO: cade o timestamp? kkkkkk"); return pd.DataFrame()
 
     # --- Criação e Agregação do DataFrame ---
     df_raw = pd.DataFrame(parsed_data)
@@ -1058,14 +1058,175 @@ def parse_csv_file(file_path):
         print(f"Erro ao ler CSV: {e}")
         return pd.DataFrame()
 
+# ==========================================
+# === Funções de Parsing Datalogger ===
+# ==========================================
+
+def parse_datalogger_file(file_path):
+    """
+    Lê um arquivo de datalogger no formato:
+
+        Time[ms];pwmL[us];curL[mA];volL[mV];pwmR[us];curR[mA];volR[mV];strini[uint10]
+        43065;2376;0;0;0;2;176;6
+        ...
+
+    e devolve um DataFrame compatível com o app, contendo:
+
+    - Timestamp (datetime) e Timestamp_str (HH:MM:SS.mmm)
+    - Voltage  -> tensão da bateria (V), no mesmo nome usado pelos outros parsers
+    - Novas colunas específicas do datalogger:
+        * ServoL_PWM_us
+        * ServoR_PWM_us
+        * ServoL_Current_mA
+        * ServoR_Current_mA
+        * ServoL_Voltage_V
+        * ServoR_Voltage_V
+        * Battery_Current_A   (corrente da bateria, strini * 210 / 1023)
+
+    As demais colunas padrão do app (Roll, Pitch, Yaw, etc.) são criadas com NaN
+    para manter compatibilidade com o restante do código.
+    """
+    if not os.path.exists(file_path):
+        print(f"ERRO: Arquivo de datalogger '{file_path}' não encontrado.")
+        return pd.DataFrame()
+
+    try:
+        # separador ';'
+        df_raw = pd.read_csv(file_path, sep=';', engine='python')
+    except Exception as e:
+        print(f"ERRO ao ler datalogger '{file_path}': {e}")
+        return pd.DataFrame()
+
+    # Renomeia colunas
+    rename_map = {
+        'Time[ms]'      : 'Time_ms',
+        'pwmL[us]'      : 'pwmL_us',
+        'curL[mA]'      : 'curL_mA',
+        'volL[mV]'      : 'volL_mV',
+        'pwmR[us]'      : 'pwmR_us',
+        'curR[mA]'      : 'curR_mA',
+        'volR[mV]'      : 'volR_mV',
+        'strini[uint10]': 'strini',
+    }
+    df_raw.rename(columns=rename_map, inplace=True)
+
+    # Garante que as colunas críticas existam
+    if 'Time_ms' not in df_raw.columns:
+        print("ERRO: coluna 'Time[ms]' ausente no datalogger.")
+        return pd.DataFrame()
+
+    # Converte numéricos
+    num_cols = ['Time_ms', 'pwmL_us', 'curL_mA', 'volL_mV',
+                'pwmR_us', 'curR_mA', 'volR_mV', 'strini']
+    for c in num_cols:
+        if c in df_raw.columns:
+            df_raw[c] = pd.to_numeric(df_raw[c], errors='coerce')
+
+    df_raw = df_raw.dropna(subset=['Time_ms']).reset_index(drop=True)
+    if df_raw.empty:
+        print("AVISO: datalogger sem linhas válidas após conversão de Time_ms.")
+        return pd.DataFrame()
+
+    # Timestamp baseado no nome da pasta (igual aos outros parsers) + tempo em ms
+    base_time = _infer_base_time_from_parent(file_path)
+    if pd.isna(base_time):
+        # fallback bem definido se o nome da pasta não tiver timestamp
+        base_time = pd.Timestamp('2024-01-01 00:00:00')
+
+    df_raw['Timestamp'] = base_time + pd.to_timedelta(df_raw['Time_ms'], unit='ms')
+    df_raw['Timestamp_str'] = df_raw['Timestamp'].dt.strftime('%H:%M:%S.%f').str[:-3]
+
+    # DataFrame de saída no formato do app
+    df_out = pd.DataFrame(index=df_raw.index)
+    df_out['Timestamp'] = df_raw['Timestamp']
+    df_out['Timestamp_str'] = df_raw['Timestamp_str']
+
+    # ------------------------------
+    # Tensão da bateria (Voltage)
+    # ------------------------------
+    # Usa o maior valor entre volL e volR como aproximação da tensão do barramento,
+    # em volts (mV -> V), para manter compatibilidade com os outros parsers.
+    voltage_series = None
+    if 'volL_mV' in df_raw.columns and 'volR_mV' in df_raw.columns:
+        voltage_series = np.maximum(df_raw['volL_mV'], df_raw['volR_mV']) / 1000.0
+    elif 'volL_mV' in df_raw.columns:
+        voltage_series = df_raw['volL_mV'] / 1000.0
+    elif 'volR_mV' in df_raw.columns:
+        voltage_series = df_raw['volR_mV'] / 1000.0
+
+    if voltage_series is not None:
+        df_out['Voltage'] = voltage_series
+    else:
+        df_out['Voltage'] = np.nan
+
+    # -------------------------------------------
+    # Novos dados específicos do datalogger
+    # -------------------------------------------
+    # Comando PWM servo esquerdo e direito
+    if 'pwmL_us' in df_raw.columns:
+        df_out['ServoL_PWM_us'] = df_raw['pwmL_us']
+    if 'pwmR_us' in df_raw.columns:
+        df_out['ServoR_PWM_us'] = df_raw['pwmR_us']
+
+    # Corrente servo esquerdo e direito (mA)
+    if 'curL_mA' in df_raw.columns:
+        df_out['ServoL_Current_mA'] = df_raw['curL_mA']
+    if 'curR_mA' in df_raw.columns:
+        df_out['ServoR_Current_mA'] = df_raw['curR_mA']
+
+    # Tensão no servo esquerdo e direito (V)
+    if 'volL_mV' in df_raw.columns:
+        df_out['ServoL_Voltage_V'] = df_raw['volL_mV'] / 1000.0
+    if 'volR_mV' in df_raw.columns:
+        df_out['ServoR_Voltage_V'] = df_raw['volR_mV'] / 1000.0
+
+    # Corrente na bateria (A) a partir de strini (uint10)
+    if 'strini' in df_raw.columns:
+        df_out['Battery_Current_A'] = df_raw['strini'] * (210.0 / 1023.0)
+
+    # -------------------------------------------
+    # Completa colunas padrão do app com NaN
+    # (mesmo contrato dos outros parsers)
+    # -------------------------------------------
+    expected_cols = [
+        'ModoVoo',
+        'Roll', 'Pitch', 'Yaw',
+        'Latitude', 'Longitude', 'AltitudeAbs',
+        'Voltage', 'Satellites', 'QNE', 'ASI', 'AT',
+        'Porcent_bat', 'RPM', 'CHT',
+        'FuelLevel_dig', 'FuelLevel_anag', 'isVTOL',
+    ]
+    for col in expected_cols:
+        if col not in df_out.columns:
+            df_out[col] = np.nan
+
+    # Garante tipos numéricos coerentes nas colunas padrão
+    numeric_cols = [
+        'Roll', 'Pitch', 'Yaw', 'Latitude', 'Longitude', 'AltitudeAbs',
+        'Voltage', 'QNE', 'ASI', 'AT', 'RPM', 'CHT',
+        'FuelLevel_dig', 'FuelLevel_anag',
+    ]
+    for col in numeric_cols:
+        if col in df_out.columns:
+            df_out[col] = pd.to_numeric(df_out[col], errors='coerce')
+
+    int_cols = ['Satellites', 'Porcent_bat', 'ModoVoo']
+    for col in int_cols:
+        if col in df_out.columns:
+            df_out[col] = pd.to_numeric(df_out[col], errors='coerce').round()
+            df_out[col] = df_out[col].astype('Int64')
+
+    df_out = df_out.sort_values('Timestamp').reset_index(drop=True)
+    print(f"INFO: Datalogger processado. DataFrame final com {len(df_out)} linhas.")
+    return df_out
+
 # ==========================================================
 # === Classe Worker Modificada para Busca Hierárquica ===
 # ==========================================================
-
 class LogProcessingWorker(QObject):
     finished = pyqtSignal(dict)
-    progress = pyqtSignal(int)      # ### ALTERADO ### Agora emite INT (porcentagem)
-    log_loaded = pyqtSignal(str, str) # ### NOVO SINAL ### (log_name, log_type)
+    progress = pyqtSignal(int)          # porcentagem
+    log_loaded = pyqtSignal(str, str)   # (log_name, log_type)
     error = pyqtSignal(str)
 
     def __init__(self, root_path):
@@ -1076,122 +1237,152 @@ class LogProcessingWorker(QObject):
     def run(self):
         try:
             loaded_logs = {}
-            # Conta diretórios primeiro para a barra de progresso
+
+            # -------------------------------------------
+            # Conta diretórios + prepara lista de itens
+            # -------------------------------------------
             try:
-                # Usa list comprehension para contar apenas diretórios
                 sub_items = list(os.scandir(self.root_path))
-                total_dirs = sum(1 for item in sub_items if item.is_dir())
+                dir_items = [item for item in sub_items if item.is_dir()]
+                # +1 para considerar a própria pasta raiz como "unidade" de processamento
+                total_units = len(dir_items) + 1
             except Exception as count_e:
-                 # Se falhar ao contar, desabilita a barra (progresso -1)
-                 print(f"Erro ao contar diretórios: {count_e}")
-                 total_dirs = 0
-                 self.progress.emit(-1) # Sinaliza que não há progresso total definido
+                print(f"Erro ao contar diretórios: {count_e}")
+                sub_items = []
+                dir_items = []
+                total_units = 0
+                # Sinaliza que não dá para estimar progresso
+                self.progress.emit(-1)
 
             processed_count = 0
 
-            for item in sub_items: # Usa a lista já lida
-                if not self._is_running: break
-                
-                if item.is_dir():
-                    folder_path = item.path
-                    log_name = item.name
-                    # self.progress.emit(f"Analisando diretório: {log_name}...") # Removemos msg de análise daqui
+            # -------------------------------------------
+            # Função interna para processar UMA pasta
+            # (serve tanto pra raiz quanto pras subpastas)
+            # -------------------------------------------
+            def process_folder(folder_path, folder_label):
+                nonlocal processed_count, loaded_logs, total_units
 
-                    df = pd.DataFrame() 
-                    log_file_path = ""
-                    found_log_type = "Nenhum"
-                    filename_found = "" # Guarda o nome do arquivo
+                if not self._is_running:
+                    return
 
-                    # 1. Procura por GCFS_AIRPLANE_*.log (Xcockpit)
-                    try: # Adiciona try-except para erros de permissão etc.
+                df_main = pd.DataFrame()
+                main_type = "Nenhum"
+                main_filename = ""
+
+                # 1. Procura por GCFS_AIRPLANE_*.log (Xcockpit)
+                try:
+                    for filename in os.listdir(folder_path):
+                        if filename.startswith("GCFS_AIRPLANE_") and filename.lower().endswith(".log"):
+                            log_file_path = os.path.join(folder_path, filename)
+                            df_main = parse_log_file(log_file_path)
+                            if not df_main.empty:
+                                main_type = "Xcockpit (.log)"
+                                main_filename = filename
+                            break
+                except Exception as list_e:
+                    print(f"Erro ao listar arquivos .log em {folder_path}: {list_e}")
+
+                # 2. Se não encontrou Xcockpit .log, procura por GCFS_AIRPLANE_*.csv
+                if df_main.empty:
+                    try:
                         for filename in os.listdir(folder_path):
-                            if filename.startswith("GCFS_AIRPLANE_") and filename.lower().endswith(".log"):
+                            if filename.startswith("GCFS_AIRPLANE_") and filename.lower().endswith(".csv"):
                                 log_file_path = os.path.join(folder_path, filename)
-                                # self.progress.emit(f"Processando XCockpit: {filename}...")
-                                df = parse_log_file(log_file_path)
-                                if not df.empty: 
-                                    found_log_type = "Xcockpit (.log)"
-                                    filename_found = filename
-                                break 
+                                df_main = parse_csv_file(log_file_path)
+                                if not df_main.empty:
+                                    main_type = "CSV (.csv)"
+                                    main_filename = filename
+                                break
                     except Exception as list_e:
-                         print(f"Erro ao listar arquivos em {folder_path}: {list_e}")
+                        print(f"Erro ao listar arquivos .csv em {folder_path}: {list_e}")
 
-                    # 2. Se não encontrou Xcockpit, procura por *.csv
-                    if df.empty:
-                        try:
-                             for filename in os.listdir(folder_path):
-                                if filename.lower().endswith(".csv"):
-                                    log_file_path = os.path.join(folder_path, filename)
-                                    # self.progress.emit(f"Processando CSV: {filename}...")
-                                    df = parse_csv_file(log_file_path)
-                                    if not df.empty: 
-                                         found_log_type = "CSV (.csv)"
-                                         filename_found = filename
-                                    break 
-                        except Exception as list_e:
-                             print(f"Erro ao listar arquivos em {folder_path}: {list_e}")
+                # 3. Se não encontrou Xcockpit nem CSV, procura por spi.log e chama o C Decoder
+                if df_main.empty:
+                    spi_path = os.path.join(folder_path, "spi.log")
+                    if os.path.exists(spi_path):
+                        df_main = parse_spi_log_via_c(spi_path)
+                        if not df_main.empty:
+                            main_type = "Embarcado (spi.log via C)"
+                            main_filename = "spi.log"
 
+                # 4. Se ainda não achou nada, procura o log embarcado AFGS_Monitoring.log
+                if df_main.empty:
+                    afgs_path = os.path.join(folder_path, "AFGS_Monitoring.log")
+                    if os.path.exists(afgs_path):
+                        df_main = parse_afgs_monitoring_log(afgs_path)
+                        if not df_main.empty:
+                            main_type = "Embarcado (AFGS_Monitoring.log)"
+                            main_filename = "AFGS_Monitoring.log"
 
-                    # 3. Se não encontrou Xcockpit nem CSV, procura por spi.log e chama o C Decoder
-                    if df.empty:
-                         spi_path = os.path.join(folder_path, "spi.log")
-                         if os.path.exists(spi_path):
-                             # self.progress.emit(f"Processando spi.log via C Decoder...")
-                             df = parse_spi_log_via_c(spi_path) 
-                             if not df.empty: 
-                                  found_log_type = "Embarcado (spi.log via C)"
-                                  filename_found = "spi.log"
-                    
-                    # 4. Se ainda não achou nada, procura o log embarcado AFGS_Monitoring.log
-                    if df.empty:
-                        afgs_path = os.path.join(folder_path, "AFGS_Monitoring.log")
-                        if os.path.exists(afgs_path):
-                            # self.progress.emit(f"Processando AFGS_Monitoring.log (embarque)...")
-                            df = parse_afgs_monitoring_log(afgs_path)
-                            if not df.empty:
-                                found_log_type = "Embarcado (AFGS_Monitoring.log)"
-                                filename_found = "AFGS_Monitoring.log"
-                    
-                    # 5. Busca .mat (embarque em .mat - mesmo mapeamento do AFGS)
-                    if df.empty:
-                        try:
-                            for filename in os.listdir(folder_path):
-                                if filename.lower().endswith(".mat"):
-                                    mat_path = os.path.join(folder_path, filename)
-                                    # self.progress.emit(f"Processando .mat embarcado: {filename}...")
-                                    df = parse_mat_file(mat_path)
-                                    if not df.empty:
-                                        found_log_type = "Embarcado (.mat)"
-                                        filename_found = filename
-                                        break
-                        except Exception as list_e:
-                            print(f"Erro ao listar/ler .mat em {folder_path}: {list_e}")
-                    
-                    # Adiciona ao resultado e EMITE SINAL
-                    if not df.empty:
-                        loaded_logs[log_name] = df
-                        self.log_loaded.emit(log_name, found_log_type) 
-                    else:
-                        # Emite info que não achou nada (opcional)
-                        # self.log_loaded.emit(log_name, "Nenhum encontrado") 
-                        pass # Ou simplesmente não emite nada
+                # 5. Busca .mat (embarcado em .mat - mesmo mapeamento do AFGS.log)
+                if df_main.empty:
+                    try:
+                        for filename in os.listdir(folder_path):
+                            if filename.lower().endswith(".mat"):
+                                mat_path = os.path.join(folder_path, filename)
+                                df_main = parse_mat_file(mat_path)
+                                if not df_main.empty:
+                                    main_type = "Embarcado (.mat)"
+                                    main_filename = filename
+                                    break
+                    except Exception as list_e:
+                        print(f"Erro ao listar/ler .mat em {folder_path}: {list_e}")
 
-                    # ### ATUALIZA PROGRESSO ###
-                    processed_count += 1
-                    if total_dirs > 0:
-                        percent = int((processed_count / total_dirs) * 100)
-                        self.progress.emit(percent)
+                # 6. Busca logXX.csv (Datalogger) – pode haver vários na mesma pasta
+                try:
+                    for filename in os.listdir(folder_path):
+                        if filename.lower().startswith("log") and filename.lower().endswith(".csv"):
+                            log_path = os.path.join(folder_path, filename)
+                            df_d = parse_datalogger_file(log_path)
+                            if not df_d.empty:
+                                # Nome exibido: <pasta> - <arquivo>
+                                display_name = f"{folder_label} - {filename}"
+                                loaded_logs[display_name] = df_d
+                                self.log_loaded.emit(display_name, "Datalogger (logXX.csv)")
+                except Exception as list_e:
+                    print(f"Erro ao ler datalogger .csv em {folder_path}: {list_e}")
+
+                # Se encontrou um log "principal" (telemetria), registra também
+                if not df_main.empty:
+                    # Se já existe chave com o mesmo nome, desambigua
+                    display_name = folder_label
+                    if display_name in loaded_logs:
+                        display_name = f"{folder_label} - {main_filename or main_type}"
+                    loaded_logs[display_name] = df_main
+                    self.log_loaded.emit(display_name, main_type)
+
+                # Atualiza progresso para essa unidade (pasta ou raiz)
+                processed_count += 1
+                if total_units > 0:
+                    percent = int((processed_count / total_units) * 100)
+                    self.progress.emit(percent)
+
+            # -------------------------------------------
+            # 1º: processa a própria pasta raiz
+            # -------------------------------------------
+            root_label = os.path.basename(os.path.normpath(self.root_path)) or self.root_path
+            process_folder(self.root_path, root_label)
+
+            # -------------------------------------------
+            # 2º: processa cada subdiretório direto
+            # -------------------------------------------
+            for item in dir_items:
+                if not self._is_running:
+                    break
+                process_folder(item.path, item.name)
 
             # Garante que a barra chegue a 100% no final, mesmo com arredondamentos
-            if self._is_running and total_dirs > 0:
+            if self._is_running and total_units > 0:
                 self.progress.emit(100)
-                
+
             if self._is_running:
                 self.finished.emit(loaded_logs)
-                
+
         except Exception as e:
             self.error.emit(f"Falha CRÍTICA no processamento dos logs: {e}")
             import traceback
-            traceback.print_exc() 
+            traceback.print_exc()
 
-    def stop(self): self._is_running = False
+    def stop(self):
+        self._is_running = False

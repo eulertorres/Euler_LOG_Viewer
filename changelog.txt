@@ -22,3 +22,6 @@ Versão 0.2.2
 + Indicador Timestamp dinâmico
 - Gráfico Padrão de Idade da solução
 + Gráfico Padrão de análise de variabilidade de vento
+
+Versão 0.3
++ Leitura logs do Datalogger (log**.csv)
