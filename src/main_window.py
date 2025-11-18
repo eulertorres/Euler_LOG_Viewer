@@ -216,7 +216,8 @@ class TelemetryApp(QMainWindow):
         self.setup_timeline_controls(self.layout) 
 
         # Define os tamanhos iniciais do splitter
-        self.splitter.setSizes([800, 800]) # Ajuste inicial, pode ser [1000, 600] ou outro
+        # Define o gráfico ocupando ~60% da largura inicial e o mapa ~40%
+        self.splitter.setSizes([3, 2])
 
     def setup_tabs(self):
         self.standard_plots_tab = StandardPlotsWidget(self) # Cria o novo widget
@@ -363,7 +364,7 @@ class TelemetryApp(QMainWindow):
 
         if self.standard_plots_tab: self.standard_plots_tab.load_dataframe(pd.DataFrame())
         if self.custom_plot_tab: self.custom_plot_tab.reload_data({})
-        if self.all_plots_tab: self.all_plots_tab.load_dataframe(pd.DataFrame())
+        if self.all_plots_tab: self.all_plots_tab.load_dataframe(pd.DataFrame(), "")
 
         self.mapWidget.setHtml("")
         self.setup_timeline()
@@ -374,7 +375,7 @@ class TelemetryApp(QMainWindow):
         self.df = self.log_data[log_name]
 
         if self.standard_plots_tab: self.standard_plots_tab.load_dataframe(self.df, self.current_log_name)
-        if self.all_plots_tab: self.all_plots_tab.load_dataframe(self.df)
+        if self.all_plots_tab: self.all_plots_tab.load_dataframe(self.df, self.current_log_name)
         # O custom_plot_tab já recebe todos os logs no on_loading_finished
 
         if self.tabs and self.standard_plots_tab:

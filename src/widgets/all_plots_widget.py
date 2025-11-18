@@ -47,6 +47,7 @@ class AllPlotsWidget(QWidget):
         self.vlines = []        # InfiniteLines (cursor) por gráfico
         self._syncing = False
         self._plot_widgets = []
+        self.current_log_name = ""
 
         # Timer de debounce para sincronizar X
         self._sync_timer = QTimer(self)
@@ -60,15 +61,18 @@ class AllPlotsWidget(QWidget):
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("background-color: white; border: none;")
         main_layout.addWidget(scroll_area)
 
         scroll_content = QWidget()
+        scroll_content.setStyleSheet("background-color: white;")
         self.plots_layout = QVBoxLayout(scroll_content)
         scroll_area.setWidget(scroll_content)
 
     # ========== API pública ==========
-    def load_dataframe(self, df: pd.DataFrame):
+    def load_dataframe(self, df: pd.DataFrame, log_name: str = ""):
         self.df = df
+        self.current_log_name = log_name or ""
         self._update_plots()
 
     def update_cursor(self, timestamp):
@@ -207,7 +211,7 @@ class AllPlotsWidget(QWidget):
     def _create_placeholder_plot(self, title):
         plotw = pg.PlotWidget(axisItems={'bottom': DateAxisItem(orientation='bottom')})
         plotw.setMinimumHeight(150)
-        plotw.setTitle(title)
+        plotw.setTitle(self._format_plot_title(title))
         txt = pg.TextItem(f"Dados para '{title}' não disponíveis.", anchor=(0.5, 0.5), color=(120, 120, 120))
         plotw.addItem(txt)
         vb = plotw.getPlotItem().getViewBox()
@@ -307,7 +311,7 @@ class AllPlotsWidget(QWidget):
         plotw = pg.PlotWidget(axisItems={'bottom': DateAxisItem(orientation='bottom')})
         plotw.setMinimumHeight(360)
         plot_item = plotw.getPlotItem()
-        plotw.setTitle(config['title'])
+        plotw.setTitle(self._format_plot_title(config['title']))
         plot_item.showGrid(x=True, y=True, alpha=0.3)
         plot_item.enableAutoRange(x=True, y=True)
 
@@ -391,6 +395,13 @@ class AllPlotsWidget(QWidget):
         self._plot_widgets.append(plotw)
 
         return plotted_cols
+
+    def _format_plot_title(self, base_title: str) -> str:
+        parts = [base_title]
+        if self.current_log_name:
+            parts.append(self.current_log_name)
+        full_title = " - ".join(parts)
+        return f"<span style='font-size:13px; font-weight:600;'>{full_title}</span>"
 
     # ---------- Legenda ----------
     def _ensure_legend(self, plot_item: pg.PlotItem, items):
