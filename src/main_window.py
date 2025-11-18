@@ -216,8 +216,7 @@ class TelemetryApp(QMainWindow):
         self.setup_timeline_controls(self.layout) 
 
         # Define os tamanhos iniciais do splitter
-        # Define o gráfico ocupando ~60% da largura inicial e o mapa ~40%
-        self.splitter.setSizes([3, 2])
+        self.splitter.setSizes([1000, 600])
 
     def setup_tabs(self):
         self.standard_plots_tab = StandardPlotsWidget(self) # Cria o novo widget
