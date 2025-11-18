@@ -8,6 +8,8 @@ import numpy as np
 import json
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from src.utils.resource_paths import find_decoder_executable
+
 signal_name_map = {
     # =======================
     # Asa Fixa (Fixed Wing)
@@ -188,19 +190,10 @@ def parse_spi_log_via_c(file_path):
     e transforma em um DataFrame Pandas unificado.
     """
     # --- Configuração ---
-    decoder_exe_path = ""
-    try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(script_dir)
-        decoder_exe_path = os.path.join(project_root, "src", "decoder.exe")
-        if not os.path.exists(decoder_exe_path):
-            decoder_exe_path = os.path.abspath("decoder.exe")
-            if not os.path.exists(decoder_exe_path):
-                 print(f"ERRO: Uaaai, cade o 'decoder.exe'?? DEVOLVE")
-                 return pd.DataFrame()
-    except Exception as e:
-         print(f"Esse caminho do decoder.exe ta zuadasso: {e}")
-         return pd.DataFrame()
+    decoder_path = find_decoder_executable()
+    if not decoder_path or not os.path.exists(decoder_path):
+        print("ERRO: Uaaai, cade o 'decoder.exe'?? DEVOLVE")
+        return pd.DataFrame()
 
     if not os.path.exists(file_path):
         print(f"Meu querido, num tem spi.log no '{file_path}' nao!")
@@ -212,7 +205,7 @@ def parse_spi_log_via_c(file_path):
     try:
         #print(f"DEBUG: Executando decoder C: {decoder_exe_path} \"{file_path}\"")
         process = subprocess.Popen(
-            [decoder_exe_path, file_path],
+            [str(decoder_path), file_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding='utf-8', errors='ignore',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
