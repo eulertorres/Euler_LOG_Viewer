@@ -37,6 +37,8 @@ from src.widgets.custom_plot_widget import CustomPlotWidget
 from src.utils.local_server import MapServer
 from src.utils.pdf_reporter import PdfReportWorker
 from src.utils.resource_paths import get_logs_directory, resource_path
+from src.utils.sharepoint_downloader import SharePointClient, SharePointCredentialError
+from src.widgets.log_download_dialog import LogDownloadDialog
 
 AIRCRAFT_ICON_PATH = resource_path('aircraft.svg')
 WIND_ICON_PATH = resource_path('seta.svg')
@@ -122,6 +124,9 @@ class TelemetryApp(QMainWindow):
 
         self.setup_ui()
 
+        self.sharepoint_client: SharePointClient | None = None
+        self.log_download_dialog: LogDownloadDialog | None = None
+
     def _register_static_assets(self):
         self.aircraft_icon_filename = self.copy_assets_to_server(AIRCRAFT_ICON_PATH)
         self.wind_icon_filename = self.copy_assets_to_server(WIND_ICON_PATH)
@@ -162,6 +167,14 @@ class TelemetryApp(QMainWindow):
         self.btn_open = QPushButton("Selecionar Diretório Raiz dos Logs")
         self.btn_open.clicked.connect(self.open_log_directories)
         top_controls_layout.addWidget(self.btn_open)
+
+        self.btn_download_sharepoint = QPushButton("Baixar Novos Logs")
+        self.btn_download_sharepoint.setToolTip(
+            "Busca automaticamente os voos publicados no SharePoint de Ensaios em Voo"
+        )
+        self.btn_download_sharepoint.clicked.connect(self.open_sharepoint_downloader)
+        top_controls_layout.addWidget(self.btn_download_sharepoint)
+
         top_controls_layout.addWidget(QLabel("Log Ativo para Visualização:"))
         self.log_selector_combo = QComboBox()
         self.log_selector_combo.currentTextChanged.connect(self._on_log_selected)
@@ -289,6 +302,66 @@ class TelemetryApp(QMainWindow):
             return
 
         self._start_loading_from_path(root_path)
+
+    def open_sharepoint_downloader(self):
+        if self.sharepoint_client is None:
+            try:
+                self.sharepoint_client = SharePointClient()
+            except SharePointCredentialError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Configuração necessária",
+                    (
+                        "Não foi possível iniciar o download automático.\n"
+                        "Verifique suas credenciais do SharePoint:\n"
+                        f"{exc}"
+                    ),
+                )
+                return
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Erro inesperado",
+                    f"Falha ao conectar no SharePoint:\n{exc}",
+                )
+                return
+
+        if self.log_download_dialog is None:
+            self.log_download_dialog = LogDownloadDialog(self.sharepoint_client, self)
+            self.log_download_dialog.logs_downloaded.connect(self.on_logs_downloaded_from_sharepoint)
+            self.log_download_dialog.destroyed.connect(self._on_log_download_dialog_destroyed)
+
+        self.log_download_dialog.show()
+        self.log_download_dialog.raise_()
+        self.log_download_dialog.activateWindow()
+
+    def _on_log_download_dialog_destroyed(self, _obj=None):
+        self.log_download_dialog = None
+
+    def on_logs_downloaded_from_sharepoint(self, base_path: Path, local_paths: list[Path]):
+        if not base_path:
+            return
+
+        self.last_logs_root = Path(base_path)
+        count = len(local_paths)
+        self.statusBar().showMessage(
+            f"{count} novos voos foram baixados para {base_path}",
+            8000,
+        )
+
+        if count == 0:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Download concluído",
+            (
+                f"{count} voos foram salvos em:\n{base_path}\n\n"
+                "Deseja carregar essa pasta agora?"
+            ),
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_loading_from_path(str(base_path))
 
     def _start_loading_from_path(self, root_path):
         if not root_path:
