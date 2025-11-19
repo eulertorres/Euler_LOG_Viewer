@@ -1,11 +1,12 @@
 import os
 import re
 import struct
-import subprocess # Para chamar o executável C
-import json       # Para parsear a saída JSON
+import subprocess  # Para chamar o executável C
+import json        # Para parsear a saída JSON
+from collections import defaultdict
+
 import pandas as pd
 import numpy as np
-import json
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from src.utils.resource_paths import find_decoder_executable
@@ -181,6 +182,56 @@ signal_name_map = {
 }
 
 # ==========================================================
+# === SPI log helpers / column aliases =====================
+# ==========================================================
+
+SPI_COLUMN_ALIASES = {
+    # Air Data Unit (ADU)
+    'static_pressure': 'QNE',
+    'dynamic_pressure': 'ASI',
+    'temperature': 'AT',
+
+    # GNSS / NMEA
+    'alt_geoid': 'AltitudeAbs',
+    'altitude_geoid': 'AltitudeAbs',
+    'altitude': 'AltitudeAbs',
+    'vert_vel': 'VSI',
+    'vertical_speed': 'VSI',
+    'Hor_Speed': 'WSI',
+    'horizontal_speed': 'WSI',
+    'NoS': 'Satellites',
+
+    # Engine / fuel (EDU)
+    'fuel_level': 'FuelLevel_dig',
+    'fuel_level_analog': 'FuelLevel_anag',
+
+    # Battery (MPDU)
+    'bms_battery_voltage_mv': 'Voltage_mv',
+    'adc_battery_voltage_mv': 'Voltage_mv_raw',
+    'bms_battery_percentage': 'Porcent_bat',
+
+    # IMU
+    'accel_x': 'Accel_X',
+    'accel_y': 'Accel_Y',
+    'accel_z': 'Accel_Z',
+    'gyro_x': 'Gyro_X',
+    'gyro_y': 'Gyro_Y',
+    'gyro_z': 'Gyro_Z',
+    'mag_x': 'Mag_X',
+    'mag_y': 'Mag_Y',
+    'mag_z': 'Mag_Z',
+}
+
+SPI_SENSOR_GROUPS = {
+    'IMU': ['Accel_X', 'Accel_Y', 'Accel_Z', 'Gyro_X', 'Gyro_Y', 'Gyro_Z'],
+    'MAG': ['Mag_X', 'Mag_Y', 'Mag_Z'],
+    'ADU': ['QNE', 'ASI', 'AT'],
+    'BMS': ['Voltage', 'Porcent_bat'],
+    'EDU': ['RPM', 'CHT', 'FuelLevel_dig', 'FuelLevel_anag'],
+    'GNSS': ['Latitude', 'Longitude', 'AltitudeAbs', 'Satellites'],
+}
+
+# ==========================================================
 # === Função para chamar o Decoder C e gerar DataFrame ===
 # ==========================================================
 
@@ -210,7 +261,7 @@ def parse_spi_log_via_c(file_path):
             encoding='utf-8', errors='ignore',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
-        stdout_data, stderr_data = process.communicate(timeout=60)
+        stdout_data, stderr_data = process.communicate()
         return_code = process.returncode
 
         if stderr_data:
@@ -226,6 +277,7 @@ def parse_spi_log_via_c(file_path):
 
     # --- Processamento da Saída JSON ---
     parsed_data = []
+    packets_by_id: dict[str, int] = defaultdict(int)
     lines = stdout_data.strip().split('\n')
     #print(f"DEBUG: Decoder C produziu {len(lines)} linhas JSON.")
     for i, line in enumerate(lines):
@@ -233,9 +285,14 @@ def parse_spi_log_via_c(file_path):
         if not line: continue
         try:
             packet = json.loads(line)
-            if 'timestamp' in packet: parsed_data.append(packet)
+            if 'timestamp' in packet:
+                parsed_data.append(packet)
+                packets_by_id[str(packet.get('id', '??'))] += 1
         except json.JSONDecodeError as e: print(f"Deu erroooo na linha {i+1}: {e}\nLinha: '{line}'"); continue
     if not parsed_data: print("AVISO: cade o timestamp? kkkkkk"); return pd.DataFrame()
+    if packets_by_id:
+        counts_sorted = ', '.join(f"{k}:{v}" for k, v in sorted(packets_by_id.items()))
+        print(f"DEBUG: Pacotes por ID -> {counts_sorted}")
 
     # --- Criação e Agregação do DataFrame ---
     df_raw = pd.DataFrame(parsed_data)
@@ -263,33 +320,90 @@ def parse_spi_log_via_c(file_path):
     df.index = df.index.round('ms')
 
     # Antes: groupby(level=0).agg(_last_non_null) percorria coluna a coluna em Python,
-    # o que travava logs longos. Agora fazemos o forward-fill dentro do grupo e
-    # mantemos apenas a última linha duplicada – essa linha já contém todos os
-    # valores válidos daquele instante.
+    # o que travava logs longos. Continuamos utilizando operações vetorizadas,
+    # mas reforçamos o preenchimento dentro dos grupos antes de eliminar duplicatas
+    # para garantir que todos os sensores daquele instante sejam preservados.
     df = df.groupby(level=0).ffill()
+    df = df.groupby(level=0).bfill()
     df = df[~df.index.duplicated(keep='last')]
     df = df.sort_index().ffill()
 
     if df.empty: print("AVISO: DataFrame vazio após agrupamento."); return pd.DataFrame()
-    
+
     # Preenche NaNs curtos (opcional)
     # df = df.ffill(limit=10) # Descomente se quiser preenchimento
 
     # --- Limpeza e Formatação Final (mesmo código anterior) ---
     df = df.drop(columns=['id', 'timestamp', 'uart_id', 'SourceID'], errors='ignore')
-    expected_cols = ['Roll', 'Pitch', 'Yaw', 'Latitude', 'Longitude', 'AltitudeAbs','Voltage', 'Satellites', 'QNE', 'ASI', 'AT', 'Porcent_bat','RPM', 'CHT', 'FuelLevel_dig', 'FuelLevel_anag', 'isVTOL']
+
+    # Normaliza nomes vindos do decoder (caso mantenha nomenclaturas antigas)
+    for src_name, dst_name in SPI_COLUMN_ALIASES.items():
+        if src_name not in df.columns:
+            continue
+        series = pd.to_numeric(df[src_name], errors='coerce')
+        if dst_name in df.columns:
+            df[dst_name] = pd.to_numeric(df[dst_name], errors='coerce').combine_first(series)
+        else:
+            df[dst_name] = series
+        if src_name != dst_name:
+            df = df.drop(columns=[src_name])
+
+    # Converte tensões em mV -> V quando necessário
+    if 'Voltage' not in df.columns and 'Voltage_mv' in df.columns:
+        df['Voltage'] = pd.to_numeric(df['Voltage_mv'], errors='coerce') / 1000.0
+    if 'Voltage_mv' in df.columns:
+        df = df.drop(columns=['Voltage_mv'])
+    if 'Voltage_mv_raw' in df.columns and 'Voltage' not in df.columns:
+        df['Voltage'] = pd.to_numeric(df['Voltage_mv_raw'], errors='coerce') / 1000.0
+    df = df.drop(columns=['Voltage_mv_raw'], errors='ignore')
+
+    df.index.name = 'Timestamp'
+    df = df.reset_index()
+
+    # Timestamp humano
+    try:
+        df['Timestamp_str'] = df['Timestamp'].dt.strftime('%H:%M:%S.%f').str[:-3]
+    except Exception:
+        df['Timestamp_str'] = None
+
+    # Derivados que o app espera em outros tipos de log
+    if 'VSI' not in df.columns or df['VSI'].isna().all():
+        if 'AltitudeAbs' in df.columns:
+            dt = df['Timestamp'].diff().dt.total_seconds()
+            vsi = df['AltitudeAbs'].diff()
+            with np.errstate(invalid='ignore', divide='ignore'):
+                vsi = vsi.divide(dt)
+            vsi = vsi.replace([np.inf, -np.inf], np.nan)
+            df['VSI'] = vsi.fillna(method='ffill')
+    if 'WSI' not in df.columns and 'ASI' in df.columns:
+        df['WSI'] = df['ASI']
+    if 'Yaw' in df.columns and not df['Yaw'].isnull().all():
+        df['Yaw'] = ((pd.to_numeric(df['Yaw'], errors='coerce') + 180) % 360) - 180
+
+    expected_cols = ['Roll', 'Pitch', 'Yaw', 'Latitude', 'Longitude', 'AltitudeAbs','Voltage', 'Satellites', 'QNE', 'ASI', 'AT', 'Porcent_bat','RPM', 'CHT', 'FuelLevel_dig', 'FuelLevel_anag', 'isVTOL', 'WSI', 'VSI']
     for col in expected_cols:
         if col not in df.columns: df[col] = np.nan
-    try: df['Timestamp_str'] = df.index.strftime('%H:%M:%S.%f').str[:-3]
-    except AttributeError: df['Timestamp_str'] = None
-    if "Yaw" in df.columns and not df["Yaw"].isnull().all(): df["Yaw"] = ((df["Yaw"] + 180) % 360) - 180
-    numeric_cols = ['Roll', 'Pitch', 'Yaw', 'Latitude', 'Longitude', 'AltitudeAbs', 'Voltage', 'QNE', 'ASI', 'AT', 'RPM', 'CHT']
+
+    numeric_cols = ['Roll', 'Pitch', 'Yaw', 'Latitude', 'Longitude', 'AltitudeAbs', 'Voltage', 'QNE', 'ASI', 'AT', 'RPM', 'CHT', 'WSI', 'VSI']
     int_cols = ['Satellites', 'Porcent_bat', 'FuelLevel_dig', 'FuelLevel_anag']
     for col in numeric_cols:
          if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
     for col in int_cols:
          if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
-    df = df.reset_index()
+
+    # Checa sensores ausentes para orientar usuário caso o decoder não exponha tudo
+    missing_groups = []
+    present_groups = []
+    for group_name, cols in SPI_SENSOR_GROUPS.items():
+        has_data = any((col in df.columns) and df[col].notna().any() for col in cols)
+        if has_data:
+            present_groups.append(group_name)
+        else:
+            missing_groups.append(group_name)
+    if present_groups:
+        print(f"INFO: Sensores detectados no spi.log -> {', '.join(sorted(present_groups))}")
+    if missing_groups:
+        print(f"AVISO: Decoder C não forneceu dados para -> {', '.join(sorted(missing_groups))}")
 
     print(f"INFO: spi.log processado via C Decoder. DataFrame final com {len(df)} linhas.")
     return df
