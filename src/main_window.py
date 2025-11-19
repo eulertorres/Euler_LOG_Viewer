@@ -10,6 +10,7 @@ import json
 import math
 import shutil
 from datetime import datetime
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -18,9 +19,10 @@ from PyQt6.QtWidgets import (
     QSlider, QLabel, QDialog, QProgressBar, QTextEdit,
     QCheckBox, QStackedWidget
 )
-from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QIODevice, QBuffer, QTimer
+from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QIODevice, QBuffer
 from PyQt6.QtGui import QMovie
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineSettings
 import pandas as pd
 import numpy as np
 import folium
@@ -34,16 +36,17 @@ from src.widgets.all_plots_widget import AllPlotsWidget
 from src.widgets.custom_plot_widget import CustomPlotWidget
 from src.utils.local_server import MapServer
 from src.utils.pdf_reporter import PdfReportWorker
+from src.utils.resource_paths import get_logs_directory, resource_path
 
-icone_aviao = 'aircraft.svg'
-icone_seta = 'seta.svg'
+AIRCRAFT_ICON_PATH = resource_path('aircraft.svg')
+WIND_ICON_PATH = resource_path('seta.svg')
+LOADING_GIF_PATH = resource_path('gato.gif')
+DEFAULT_LOGS_DIR = get_logs_directory()
 
 class LoadingDialog(QDialog):
-    """
-    Um diálogo modal simples, sem bordas e transparente
-    para mostrar um GIF de carregamento.
-    """
-    def __init__(self, parent=None):
+    """Diálogo modal para exibir um GIF de carregamento."""
+
+    def __init__(self, parent=None, animation_path=None):
         super().__init__(parent)
         
         # Remove a barra de título e deixa o fundo transparente
@@ -53,7 +56,8 @@ class LoadingDialog(QDialog):
 
         # Label para conter o GIF
         self.label = QLabel(self)
-        self.movie = QMovie("gato.gif")
+        gif_path = str(animation_path) if animation_path else "gato.gif"
+        self.movie = QMovie(gif_path)
         
         if not self.movie.isValid():
             print("AVISO: Não foi possível carregar o gato.gif!")
@@ -87,6 +91,9 @@ class TelemetryApp(QMainWindow):
         self.thread = None
         self.worker = None
 
+        self.default_logs_dir = DEFAULT_LOGS_DIR
+        self.last_logs_root = DEFAULT_LOGS_DIR
+
         self.map_server = MapServer()
         self.map_server.start()
         self.temp_map_file_path = ""
@@ -96,7 +103,7 @@ class TelemetryApp(QMainWindow):
         self.wind_marker_js_name = ""
         self.standard_plots_tab = None
 
-        self.loading_widget = LoadingDialog(self)
+        self.loading_widget = LoadingDialog(self, animation_path=LOADING_GIF_PATH)
 
         self.view_toggle_checkbox = None
         self.map_stack = None
@@ -108,35 +115,42 @@ class TelemetryApp(QMainWindow):
         self.cesium_current_html = ""
         self.cesium_ready = False
 
-        self.copy_assets_to_server(icone_aviao)
-        self.copy_assets_to_server(icone_seta)
+        self.aircraft_icon_filename = None
+        self.wind_icon_filename = None
+
+        self._register_static_assets()
 
         self.setup_ui()
 
-    def copy_assets_to_server(self, icon):
+    def _register_static_assets(self):
+        self.aircraft_icon_filename = self.copy_assets_to_server(AIRCRAFT_ICON_PATH)
+        self.wind_icon_filename = self.copy_assets_to_server(WIND_ICON_PATH)
+
+    def copy_assets_to_server(self, icon_path):
         """Copia arquivos estáticos necessários (ex: ícone) para o diretório do servidor."""
+
         try:
-            # O arquivo SVG deve estar na raiz do projeto (onde run.py está)
-            source_icon_path = icon
-            if not os.path.exists(source_icon_path):
-                print(f"AVISO: Arquivo '{source_icon_path}' não encontrado na raiz do projeto. O ícone do avião pode não aparecer.")
-                return # Não faz nada se o arquivo não existir
+            if not icon_path:
+                return None
 
-            dest_dir = self.map_server.get_temp_dir()
-            # Verifica se o diretório de destino existe (deve existir se o servidor iniciou)
-            if not os.path.isdir(dest_dir):
-                 print(f"ERRO: Diretório do servidor '{dest_dir}' não encontrado.")
-                 return
+            source_icon_path = Path(icon_path)
+            if not source_icon_path.exists():
+                print(f"AVISO: Arquivo '{source_icon_path}' não encontrado. O ícone pode não aparecer.")
+                return None
 
-            dest_path = os.path.join(dest_dir, os.path.basename(source_icon_path))
+            dest_dir = Path(self.map_server.get_temp_dir())
+            if not dest_dir.exists():
+                print(f"ERRO: Diretório do servidor '{dest_dir}' não encontrado.")
+                return None
 
-            # Copia o arquivo
-            shutil.copy2(source_icon_path, dest_path) # copy2 preserva metadados
-            #print(f"DEBUG: Ícone '{source_icon_path}' copiado para '{dest_path}'.")
+            dest_path = dest_dir / source_icon_path.name
+            shutil.copy2(source_icon_path, dest_path)
+            return source_icon_path.name
 
         except Exception as e:
             print(f"ERRO CRÍTICO ao copiar assets para o servidor: {e}")
-            QMessageBox.warning(self, "Erro de Asset", f"Não foi possível copiar o ícone do avião para o servidor:\n{e}")
+            QMessageBox.warning(self, "Erro de Asset", f"Não foi possível copiar o ícone para o servidor:\n{e}")
+            return None
         
     def setup_ui(self):
         self.central_widget = QWidget()
@@ -196,8 +210,10 @@ class TelemetryApp(QMainWindow):
         map_panel_layout = QVBoxLayout(map_panel_widget)
         map_panel_layout.setContentsMargins(0, 0, 0, 0) # Sem margens internas
         self.mapWidget = QWebEngineView()
+        self._configure_webview(self.mapWidget)
         self.mapWidget.loadFinished.connect(self.on_map_load_finished)
         self.cesiumWidget = QWebEngineView()
+        self._configure_webview(self.cesiumWidget)
         self.cesiumWidget.loadFinished.connect(self.on_cesium_load_finished)
 
         self.map_stack = QStackedWidget()
@@ -217,6 +233,19 @@ class TelemetryApp(QMainWindow):
 
         # Define os tamanhos iniciais do splitter
         self.splitter.setSizes([1000, 600])
+
+    def _configure_webview(self, webview):
+        if not webview:
+            return
+        settings = webview.settings()
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+            True,
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,
+            True,
+        )
 
     def setup_tabs(self):
         self.standard_plots_tab = StandardPlotsWidget(self) # Cria o novo widget
@@ -250,34 +279,48 @@ class TelemetryApp(QMainWindow):
         parent_layout.addLayout(timeline_layout)
 
     def open_log_directories(self):
+        start_dir = str(self.last_logs_root) if self.last_logs_root else ""
         root_path = QFileDialog.getExistingDirectory(
-            self, "Seleciona a PASTA que tem as pastas dos .logs. É so isso mano, você consegue"
+            self,
+            "Seleciona a PASTA que tem as pastas dos .logs. É so isso mano, você consegue",
+            start_dir,
         )
         if not root_path:
             return
 
+        self._start_loading_from_path(root_path)
+
+    def _start_loading_from_path(self, root_path):
+        if not root_path:
+            return
+
+        self.last_logs_root = Path(root_path)
         self._clear_all_data()
         self.btn_open.setEnabled(False)
 
-        self.setWindowTitle("Carregando Logs... (～￣▽￣)～") # Muda título
-        self.statusBar().showMessage("Calma ai deixa eu ver se tem log mesmo aqui na pasta..")
+        self.setWindowTitle("Carregando Logs... (～￣▽￣)～")
+        self.statusBar().showMessage(f"Carregando logs a partir de: {root_path}")
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Dando uma olhada... %p%")
         self.status_log_output.clear()
-        self.loading_status_widget.show() # Mostra barra e área de texto
-        QApplication.processEvents() # Força a UI a atualizar
+        self.loading_status_widget.show()
+        QApplication.processEvents()
 
         self.loading_widget.start_animation()
-        self.loading_widget.open()        
+        self.loading_widget.open()
 
-        self.thread = QThread(); self.worker = LogProcessingWorker(root_path)
-        self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.on_loading_finished); self.worker.error.connect(self.on_loading_error)
-        
-        self.worker.progress.connect(self.on_loading_progress) 
-        self.worker.log_loaded.connect(self.on_log_item_loaded) # Conecta ao novo slot
-        
-        self.worker.finished.connect(self.thread.quit); self.worker.finished.connect(self.worker.deleteLater); self.thread.finished.connect(self.thread.deleteLater)
+        self.thread = QThread()
+        self.worker = LogProcessingWorker(root_path)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.on_loading_finished)
+        self.worker.error.connect(self.on_loading_error)
+        self.worker.progress.connect(self.on_loading_progress)
+        self.worker.log_loaded.connect(self.on_log_item_loaded)
+
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
     def on_log_item_loaded(self, log_name, log_type):
@@ -464,9 +507,12 @@ class TelemetryApp(QMainWindow):
         folium.Marker(location=coords[-1], popup="Fim", icon=folium.Icon(color="red")).add_to(m)
 
         # --- Ícone do aviaum  ---
-        icon_filename = 'aircraft.svg'
-        port = self.map_server.get_port()
-        icon_url = f"http://127.0.0.1:{port}/{icon_filename}"
+        temp_dir = Path(self.map_server.get_temp_dir())
+        icon_filename = self.aircraft_icon_filename
+        icon_url = None
+        if icon_filename:
+            icon_path = temp_dir / icon_filename
+            icon_url = QUrl.fromLocalFile(str(icon_path)).toString()
         
         icon_size = (60, 60)       # Tamanho desejado do ícone em pixels
         icon_aircraft_anchor = (30, 30)     # Ponto do ícone que corresponde à coordenada (centro)
@@ -494,12 +540,15 @@ class TelemetryApp(QMainWindow):
         </div>
         """
         try:
-            aircraft_icon = folium.DivIcon(html=aircraft_html, icon_anchor=icon_aircraft_anchor)
-            aircraft_marker = folium.Marker(
-                location=coords[0],
-                icon=aircraft_icon,
-                popup='Aeronave'
-            )
+            if icon_url:
+                aircraft_icon = folium.DivIcon(html=aircraft_html, icon_anchor=icon_aircraft_anchor)
+                aircraft_marker = folium.Marker(
+                    location=coords[0],
+                    icon=aircraft_icon,
+                    popup='Aeronave'
+                )
+            else:
+                raise FileNotFoundError('Ícone do avião indisponível')
             aircraft_marker.add_to(m)
             self.aircraft_marker_js_name = aircraft_marker.get_name()
             print(f"DEBUG: Marcador de avião criado com DivIcon. Nome JS: {self.aircraft_marker_js_name}")
@@ -518,8 +567,11 @@ class TelemetryApp(QMainWindow):
             print("AVISO: Vish mano, vo usar o circulo pq num tem imagem do aviao.")
 
         # --- Ícone da Seta de Vento ---
-        icon_wind_filename = 'seta.svg'
-        icon_wind_url = f"http://127.0.0.1:{port}/{icon_wind_filename}"
+        icon_wind_filename = self.wind_icon_filename
+        icon_wind_url = None
+        if icon_wind_filename:
+            icon_wind_path = temp_dir / icon_wind_filename
+            icon_wind_url = QUrl.fromLocalFile(str(icon_wind_path)).toString()
         icon_wind_size = (120, 120); icon_wind_anchor = (60, 60) # Centralizado
         # Posiciona a seta um pouco acima e à direita do avião via margens negativas
         # Ajuste 'margin-left' e 'margin-top' para mudar a posição relativa
@@ -533,11 +585,15 @@ class TelemetryApp(QMainWindow):
         </div>
         """
         try:
-            wind_icon = folium.DivIcon(html=wind_html, icon_size=icon_wind_size, icon_anchor=icon_wind_anchor)
-            # Cria o marcador da seta NA MESMA POSIÇÃO INICIAL do avião (o offset é visual no HTML)
-            wind_marker = folium.Marker(location=coords[0], icon=wind_icon, popup='Vento', interactive=False, keyboard=False)
-            wind_marker.add_to(m); self.wind_marker_js_name = wind_marker.get_name()
-            print(f"DEBUG: Marcador de vento criado. Nome JS: {self.wind_marker_js_name}")
+            if icon_wind_url:
+                wind_icon = folium.DivIcon(html=wind_html, icon_size=icon_wind_size, icon_anchor=icon_wind_anchor)
+                # Cria o marcador da seta NA MESMA POSIÇÃO INICIAL do avião (o offset é visual no HTML)
+                wind_marker = folium.Marker(location=coords[0], icon=wind_icon, popup='Vento', interactive=False, keyboard=False)
+                wind_marker.add_to(m)
+                self.wind_marker_js_name = wind_marker.get_name()
+                print(f"DEBUG: Marcador de vento criado. Nome JS: {self.wind_marker_js_name}")
+            else:
+                raise FileNotFoundError('Ícone de vento indisponível')
         except Exception as e:
             print(f"ERRO ao criar ícone de vento: {e}"); self.wind_marker_js_name = "" # Reseta
 
@@ -595,14 +651,12 @@ class TelemetryApp(QMainWindow):
         """
         m.get_root().html.add_child(folium.Element(js_update_function))
 
-        temp_dir = self.map_server.get_temp_dir()
-        self.temp_map_file_path = os.path.join(temp_dir, f"map_{time.time()}.html")
+        temp_dir_str = self.map_server.get_temp_dir()
+        self.temp_map_file_path = os.path.join(temp_dir_str, f"map_{time.time()}.html")
         m.save(self.temp_map_file_path)
-        map_filename = os.path.basename(self.temp_map_file_path)
-        # port = self.map_server.get_port() # Já pegamos antes
-        url_map_html = f"http://127.0.0.1:{port}/{map_filename}"
+        map_url = QUrl.fromLocalFile(self.temp_map_file_path)
         self.map_is_ready = False
-        self.mapWidget.load(QUrl(url_map_html))
+        self.mapWidget.load(map_url)
 
     def cleanup_cesium_html(self):
         if self.cesium_current_html and os.path.exists(self.cesium_current_html):
@@ -615,16 +669,15 @@ class TelemetryApp(QMainWindow):
     def ensure_cesium_assets(self):
         if self.cesium_assets_ready and os.path.isdir(self.cesium_dist_path):
             return True
-        project_root = os.path.dirname(os.path.abspath(__file__))
-        dist_dir = os.path.join(os.path.dirname(project_root), 'UAVLogViewer', 'dist')
-        if not os.path.isdir(dist_dir):
+        dist_dir = resource_path('UAVLogViewer', 'dist')
+        if not dist_dir.exists():
             QMessageBox.warning(self, "Viewer 3D", "Build do UAVLogViewer não encontrado. Execute npm run build em UAVLogViewer.")
             return False
         dest_dir = os.path.join(self.map_server.get_temp_dir(), 'cesium_dist')
         try:
             if os.path.isdir(dest_dir):
                 shutil.rmtree(dest_dir)
-            shutil.copytree(dist_dir, dest_dir)
+            shutil.copytree(str(dist_dir), dest_dir)
         except Exception as exc:
             QMessageBox.warning(self, "Viewer 3D", f"Erro ao preparar assets do Cesium: {exc}")
             return False
