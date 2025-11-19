@@ -4,7 +4,6 @@
 
 import sys
 import os
-import io
 import time
 import json
 import math
@@ -18,7 +17,7 @@ from PyQt6.QtWidgets import (
     QSlider, QLabel, QDialog, QProgressBar, QTextEdit,
     QCheckBox, QStackedWidget
 )
-from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QIODevice, QBuffer, QTimer
+from PyQt6.QtCore import Qt, QUrl, QThread, QTimer
 from PyQt6.QtGui import QMovie
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 import pandas as pd
@@ -33,7 +32,7 @@ from src.widgets.standard_plots_widget import StandardPlotsWidget
 from src.widgets.all_plots_widget import AllPlotsWidget
 from src.widgets.custom_plot_widget import CustomPlotWidget
 from src.utils.local_server import MapServer
-from src.utils.pdf_reporter import PdfReportWorker
+from src.utils.report_generator import ReportGenerationManager
 
 icone_aviao = 'aircraft.svg'
 icone_seta = 'seta.svg'
@@ -97,6 +96,12 @@ class TelemetryApp(QMainWindow):
         self.standard_plots_tab = None
 
         self.loading_widget = LoadingDialog(self)
+
+        self.report_manager = ReportGenerationManager()
+        self.report_manager.finished.connect(self.on_pdf_finished)
+        self.report_manager.error.connect(self.on_pdf_error)
+        self.report_manager.status.connect(self.statusBar().showMessage)
+        self.report_manager.started.connect(self._on_report_started)
 
         self.view_toggle_checkbox = None
         self.map_stack = None
@@ -885,58 +890,21 @@ class TelemetryApp(QMainWindow):
 
         if not file_path:
             return
-        
-        self.statusBar().showMessage("Capturando imagens para o relatório...")
-        QApplication.processEvents()
 
-        plot_images = self._capture_plot_images()
-        map_images = self._capture_map_images()
+        self.report_manager.generate_pdf(
+            file_path=file_path,
+            current_log_name=self.current_log_name,
+            log_data=self.log_data,
+            standard_tab=self.standard_plots_tab,
+            all_tab=self.all_plots_tab,
+            map_widget=self.mapWidget,
+            map_js_name=self.map_js_name,
+            map_is_ready=self.map_is_ready,
+        )
 
-        self.statusBar().showMessage("Escrevendo arquivo PDF em segundo plano...")
+    def _on_report_started(self):
+        self.statusBar().showMessage("Gerando relatório analítico em PDF...")
         self.btn_save_pdf.setEnabled(False)
-
-        self.pdf_thread = QThread()
-        self.pdf_worker = PdfReportWorker(file_path, self.current_log_name, plot_images, map_images)
-        self.pdf_worker.moveToThread(self.pdf_thread)
-
-        self.pdf_thread.started.connect(self.pdf_worker.run)
-        self.pdf_worker.finished.connect(self.on_pdf_finished)
-        self.pdf_worker.error.connect(self.on_pdf_error)
-        
-        self.pdf_worker.finished.connect(self.pdf_thread.quit)
-        self.pdf_worker.finished.connect(self.pdf_worker.deleteLater)
-        self.pdf_thread.finished.connect(self.pdf_thread.deleteLater)
-
-        self.pdf_thread.start()
-
-    def _capture_plot_images(self):
-        images = []
-        canvas_list = self.all_plots_tab.findChildren(FigureCanvas)
-        for canvas in canvas_list:
-            buf = io.BytesIO()
-            canvas.figure.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-            buf.seek(0)
-            images.append(buf)
-        return images
-        
-    def _capture_map_images(self):
-         # ### ALTERAÇÃO ### Usa o nome JS do mapa (self.map_js_name) em vez de window.map_instance
-        images = []
-        map_zooms = [17, 15, 12]
-        if not self.map_js_name: # Verifica se temos o nome JS do mapa
-             print("AVISO: Nome JS do mapa não definido. Pulando captura de mapas.")
-             return images
-        for zoom in map_zooms:
-            if not self.map_is_ready: continue
-            # Usa o nome correto da instância do mapa
-            self.mapWidget.page().runJavaScript(f"{self.map_js_name}.setZoom({zoom});")
-            start_time = time.time()
-            while time.time() < start_time + 1.5: QApplication.processEvents()
-            pixmap = self.mapWidget.grab(); buffer = QBuffer(); buffer.open(QIODevice.OpenModeFlag.ReadWrite)
-            pixmap.save(buffer, "PNG"); img_bytes = io.BytesIO(buffer.data()); img_bytes.seek(0); images.append(img_bytes)
-        # Usa o nome correto da instância do mapa
-        self.mapWidget.page().runJavaScript(f"{self.map_js_name}.setZoom(15);")
-        return images
 
     def on_pdf_finished(self, file_path):
         self.statusBar().showMessage(f"Relatório salvo em: {file_path}", 10000)
