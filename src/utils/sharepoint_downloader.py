@@ -1,35 +1,26 @@
-"""Ferramentas para listar e baixar logs diretamente do SharePoint."""
+"""Ferramentas para listar e copiar logs a partir da pasta local do SharePoint."""
 from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Sequence
-from urllib.parse import quote
 
-try:
-    from office365.runtime.auth.user_credential import UserCredential
-    from office365.sharepoint.client_context import ClientContext
-
-    HAS_OFFICE365 = True
-except ImportError:  # pragma: no cover - biblioteca externa
-    UserCredential = None  # type: ignore
-    ClientContext = None  # type: ignore
-    HAS_OFFICE365 = False
-
-SHAREPOINT_SITE_URL = "https://xmobotsaeroespacial.sharepoint.com/sites/ensaiosemvoo"
-SHAREPOINT_PROGRAMS_ROOT = "/sites/ensaiosemvoo/Shared Documents/[00] PROGRAMAS"
 SHAREPOINT_ENSAIOS_FOLDER = "[01] Ensaios"
 FLIGHT_FOLDER_RE = re.compile(
     r"^(?P<class>[A-Z]{2})(?P<program>[A-Z0-9]{2})-(?P<date>\d{8})-(?P<flight>\d+)-(?P<serial>[A-Za-z0-9]+)$"
 )
+CONFIG_DIR = Path.home() / ".config" / "xmobots"
+PROGRAMS_ROOT_FILE = CONFIG_DIR / "programs_root.json"
+PROGRAMS_ROOT_KEY = "programs_root"
 
 
 class SharePointCredentialError(RuntimeError):
-    """Erro disparado quando as credenciais não estão configuradas."""
+    """Erro disparado quando a pasta sincronizada não está configurada."""
 
 
 @dataclass(slots=True)
@@ -44,7 +35,7 @@ class SharePointProgram:
 class SharePointFlight:
     program: SharePointProgram
     name: str
-    server_relative_url: str
+    relative_path: Path
     serial_folder: str | None
     date: datetime | None
 
@@ -74,91 +65,124 @@ DEFAULT_PROGRAMS: Sequence[SharePointProgram] = (
 )
 
 
-def _encode_sharepoint_path_part(part: str) -> str:
-    stripped = part.strip("/")
-    # Mantém colchetes, pois fazem parte da nomenclatura oficial das pastas
-    return quote(stripped, safe="[] -_")
+def _dedupe_paths(paths: List[Path]) -> List[Path]:
+    seen = set()
+    unique: List[Path] = []
+    for path in paths:
+        resolved = Path(path).expanduser()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return unique
 
 
-def build_sharepoint_path(*parts: str) -> str:
-    cleaned = [p for p in parts if p]
-    if not cleaned:
-        return SHAREPOINT_PROGRAMS_ROOT
-    sanitized = [_encode_sharepoint_path_part(p) for p in cleaned]
-    joined = "/".join(sanitized)
-    if cleaned[0].startswith("/"):
-        return "/" + joined.lstrip("/")
-    return "/" + joined
+def _load_saved_programs_root() -> Path | None:
+    if PROGRAMS_ROOT_FILE.exists():
+        try:
+            payload = json.loads(PROGRAMS_ROOT_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+        saved = payload.get(PROGRAMS_ROOT_KEY)
+        if saved:
+            candidate = Path(saved).expanduser()
+            if candidate.exists():
+                return candidate
+    return None
 
 
-def load_sharepoint_credentials() -> tuple[str, str]:
-    username = os.environ.get("XMOBOTS_SP_USERNAME")
-    password = os.environ.get("XMOBOTS_SP_PASSWORD")
-    if username and password:
-        return username, password
+def _default_programs_root_candidates() -> List[Path]:
+    candidates: List[Path] = []
+    env_dir = os.environ.get("XMOBOTS_PROGRAMS_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
 
-    config_path = Path.home() / ".config" / "xmobots" / "sharepoint.json"
-    if config_path.exists():
-        with config_path.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-        username = payload.get("username")
-        password = payload.get("password")
-        if username and password:
-            return username, password
+    saved = _load_saved_programs_root()
+    if saved:
+        candidates.append(saved)
 
-    raise SharePointCredentialError(
-        "Defina XMOBOTS_SP_USERNAME e XMOBOTS_SP_PASSWORD ou configure ~/.config/xmobots/sharepoint.json"
-    )
+    home = Path.home()
+    onedrive_hints = [
+        "OneDrive - XMOBOTS AEROESPACIAL E DEFESA LTDA",
+        "OneDrive - XMOBOTS AEROSPACIAL E DEFESA LTDA",
+        "OneDrive - XMOBOTS AEROSPACEIAL E DEFESA LTDA",
+    ]
+    for hint in onedrive_hints:
+        base = home / hint
+        candidates.append(base / "Departamento de Ensaios em voo" / "[00] PROGRAMAS")
+        candidates.append(base / "[00] PROGRAMAS")
+
+    for folder in home.glob("OneDrive*XMOBOTS*"):
+        candidates.append(folder / "Departamento de Ensaios em voo" / "[00] PROGRAMAS")
+        candidates.append(folder / "[00] PROGRAMAS")
+
+    candidates.append(home / "Departamento de Ensaios em voo" / "[00] PROGRAMAS")
+    candidates.append(home / "[00] PROGRAMAS")
+
+    return _dedupe_paths([c for c in candidates if c])
+
+
+def _save_programs_root(path: Path) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {PROGRAMS_ROOT_KEY: str(path)}
+    PROGRAMS_ROOT_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 class SharePointClient:
-    """Cliente simples para varrer a estrutura de diretórios do SharePoint."""
+    """Cliente simples que trabalha sobre a pasta local sincronizada."""
 
-    def __init__(self, username: str | None = None, password: str | None = None):
-        if not HAS_OFFICE365:
-            raise SharePointCredentialError(
-                "Instale o pacote Office365-REST-Python-Client para usar o downloader de logs."
-            )
-        self.username: str
-        self.password: str
-        if username and password:
-            self.username = username
-            self.password = password
+    def __init__(self, programs_root: Path | None = None):
+        self.programs_root: Path | None = None
+        if programs_root:
+            self.set_programs_root(programs_root, persist=False)
         else:
-            self.username, self.password = load_sharepoint_credentials()
+            for candidate in _default_programs_root_candidates():
+                if candidate.exists():
+                    self.programs_root = candidate
+                    break
 
-    def create_context(self) -> ClientContext:
-        return ClientContext(SHAREPOINT_SITE_URL).with_credentials(
-            UserCredential(self.username, self.password)
-        )
+    def has_valid_programs_root(self) -> bool:
+        return self.programs_root is not None and self.programs_root.exists()
+
+    def require_programs_root(self) -> Path:
+        if not self.has_valid_programs_root():
+            raise SharePointCredentialError(
+                "Selecione a pasta '[00] PROGRAMAS' sincronizada com o SharePoint no OneDrive."
+            )
+        return Path(self.programs_root)
+
+    def set_programs_root(self, path: Path, persist: bool = True) -> None:
+        resolved = Path(path).expanduser()
+        if not resolved.exists() or not resolved.is_dir():
+            raise FileNotFoundError(f"Pasta inválida: {resolved}")
+        self.programs_root = resolved
+        if persist:
+            _save_programs_root(resolved)
 
     def list_flights(self, program: SharePointProgram) -> List[SharePointFlight]:
-        ctx = self.create_context()
-        ensaios_path = build_sharepoint_path(
-            SHAREPOINT_PROGRAMS_ROOT,
-            program.folder_name,
-            SHAREPOINT_ENSAIOS_FOLDER,
-        )
+        root = self.require_programs_root()
+        ensaios_path = root / program.folder_name / SHAREPOINT_ENSAIOS_FOLDER
         flights: List[SharePointFlight] = []
-        self._walk_program(ctx, program, ensaios_path, None, flights)
+        if not ensaios_path.exists():
+            return flights
+        self._walk_program(program, root, ensaios_path, None, flights)
         flights.sort(key=lambda flight: (flight.date or datetime.min), reverse=True)
         return flights
 
     def _walk_program(
         self,
-        ctx: ClientContext,
         program: SharePointProgram,
-        folder_url: str,
+        root: Path,
+        folder_path: Path,
         serial_hint: str | None,
         flights: List[SharePointFlight],
     ) -> None:
-        folder = ctx.web.get_folder_by_server_relative_url(folder_url)
-        sub_folders = folder.folders.get().execute_query()
-        for sub in sub_folders:
-            name = sub.properties.get("Name")
-            server_relative_url = sub.serverRelativeUrl
-            if not name:
+        if not folder_path.exists():
+            return
+        for entry in sorted(folder_path.iterdir()):
+            if not entry.is_dir():
                 continue
+            name = entry.name
             match = FLIGHT_FOLDER_RE.match(name)
             if match:
                 date = datetime.strptime(match.group("date"), "%Y%m%d")
@@ -166,7 +190,7 @@ class SharePointClient:
                     SharePointFlight(
                         program=program,
                         name=name,
-                        server_relative_url=server_relative_url,
+                        relative_path=entry.relative_to(root),
                         serial_folder=serial_hint,
                         date=date,
                     )
@@ -176,47 +200,37 @@ class SharePointClient:
             next_serial = serial_hint
             if name.upper().startswith("NS"):
                 next_serial = name
-            self._walk_program(ctx, program, server_relative_url, next_serial, flights)
+            self._walk_program(program, root, entry, next_serial, flights)
 
     def download_flight(
         self,
-        ctx: ClientContext,
         flight: SharePointFlight,
         destination_root: Path,
         progress_callback: Callable[[str], None] | None = None,
     ) -> Path:
+        root = self.require_programs_root()
+        source_dir = root / flight.relative_path
+        if not source_dir.exists():
+            raise FileNotFoundError(f"Voo não encontrado em {source_dir}")
         target_dir = destination_root / flight.local_subpath()
-        target_dir.mkdir(parents=True, exist_ok=True)
-        self._download_folder(ctx, flight.server_relative_url, target_dir, progress_callback)
+        self._copy_folder(source_dir, target_dir, progress_callback)
         return target_dir
 
-    def _download_folder(
+    def _copy_folder(
         self,
-        ctx: ClientContext,
-        folder_url: str,
-        local_path: Path,
+        source: Path,
+        destination: Path,
         progress_callback: Callable[[str], None] | None,
     ) -> None:
-        local_path.mkdir(parents=True, exist_ok=True)
-        folder = ctx.web.get_folder_by_server_relative_url(folder_url)
-        files = folder.files.get().execute_query()
-        for sp_file in files:
-            file_url = sp_file.serverRelativeUrl
-            file_name = sp_file.properties.get("Name")
-            if not file_name:
-                continue
-            destination = local_path / file_name
-            with destination.open("wb") as fh:
-                ctx.web.get_file_by_server_relative_url(file_url).download(fh).execute_query()
-            if progress_callback:
-                progress_callback(file_name)
-
-        sub_folders = folder.folders.get().execute_query()
-        for sub in sub_folders:
-            name = sub.properties.get("Name")
-            if not name:
-                continue
-            self._download_folder(ctx, sub.serverRelativeUrl, local_path / name, progress_callback)
+        destination.mkdir(parents=True, exist_ok=True)
+        for entry in source.iterdir():
+            target = destination / entry.name
+            if entry.is_dir():
+                self._copy_folder(entry, target, progress_callback)
+            elif entry.is_file():
+                shutil.copy2(entry, target)
+                if progress_callback:
+                    progress_callback(entry.name)
 
 
 def available_programs() -> Sequence[SharePointProgram]:

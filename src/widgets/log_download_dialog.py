@@ -1,4 +1,4 @@
-"""Diálogo moderno para baixar logs diretamente do SharePoint."""
+"""Diálogo moderno para copiar logs da pasta local sincronizada."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDateEdit,
     QDialog,
+    QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -63,7 +64,6 @@ class SharePointDownloadWorker(QObject):
 
     def run(self):
         try:
-            ctx = self.client.create_context()
             total = len(self.flights)
             downloaded_paths: List[Path] = []
             if total == 0:
@@ -71,24 +71,24 @@ class SharePointDownloadWorker(QObject):
                 return
             for idx, flight in enumerate(self.flights, start=1):
                 percent = int((idx - 1) / total * 100)
-                self.progress.emit(percent, f"Baixando {flight.name} ({idx}/{total})")
-                local_path = self.client.download_flight(ctx, flight, self.destination)
+                self.progress.emit(percent, f"Copiando {flight.name} ({idx}/{total})")
+                local_path = self.client.download_flight(flight, self.destination)
                 downloaded_paths.append(local_path)
-            self.progress.emit(100, "Download concluído")
+            self.progress.emit(100, "Cópia concluída")
             self.finished.emit(downloaded_paths)
         except Exception as exc:  # pragma: no cover - depende da API
             self.error.emit(str(exc))
 
 
 class LogDownloadDialog(QDialog):
-    """Interface guiada para baixar logs do SharePoint com poucos cliques."""
+    """Interface guiada para copiar logs da pasta sincronizada com poucos cliques."""
 
     logs_downloaded = pyqtSignal(Path, list)
 
     def __init__(self, client: SharePointClient, parent=None):
         super().__init__(parent)
         self.client = client
-        self.setWindowTitle("Baixar logs do SharePoint")
+        self.setWindowTitle("Copiar logs da pasta PROGRAMAS")
         self.resize(1000, 720)
 
         self.programs = list(available_programs())
@@ -99,15 +99,19 @@ class LogDownloadDialog(QDialog):
         self._download_thread: QThread | None = None
         self._is_busy = False
         self._current_destination: Path | None = None
+        self.origin_path_label: QLabel | None = None
+        self.btn_change_origin: QPushButton | None = None
 
         self._build_ui()
+        self._refresh_origin_path_label()
 
     # ------------------------------ UI ---------------------------------
     def _build_ui(self):
         layout = QVBoxLayout(self)
         header = QLabel(
-            "<h2>Download inteligente de logs</h2>"
-            "<p>Escolha um programa, filtre os voos desejados e baixe tudo direto para sua pasta de Logs.</p>"
+            "<h2>Copiar logs sincronizados</h2>"
+            "<p>Escolha um programa, filtre os voos desejados e copie tudo da sua pasta local"
+            " '[00] PROGRAMAS' para a pasta de Logs do aplicativo.</p>"
         )
         header.setWordWrap(True)
         layout.addWidget(header)
@@ -137,6 +141,15 @@ class LogDownloadDialog(QDialog):
     def _build_program_page(self) -> QWidget:
         widget = QWidget()
         page_layout = QVBoxLayout(widget)
+        origin_layout = QHBoxLayout()
+        origin_layout.addWidget(QLabel("Origem dos arquivos:"))
+        self.origin_path_label = QLabel()
+        self.origin_path_label.setWordWrap(True)
+        origin_layout.addWidget(self.origin_path_label, 1)
+        self.btn_change_origin = QPushButton("Alterar pasta...")
+        self.btn_change_origin.clicked.connect(self._change_origin_folder)
+        origin_layout.addWidget(self.btn_change_origin)
+        page_layout.addLayout(origin_layout)
         page_layout.addWidget(QLabel("Escolha o programa da aeronave:"))
 
         self.program_list = QListWidget()
@@ -225,13 +238,67 @@ class LogDownloadDialog(QDialog):
 
         download_layout = QHBoxLayout()
         download_layout.addStretch(1)
-        self.btn_download = QPushButton("⬇️ Baixar voos selecionados")
+        self.btn_download = QPushButton("⬇️ Copiar voos selecionados")
         self.btn_download.setEnabled(False)
         self.btn_download.clicked.connect(self._start_download)
         download_layout.addWidget(self.btn_download)
         page_layout.addLayout(download_layout)
 
         return widget
+
+    def _refresh_origin_path_label(self):
+        if not self.origin_path_label:
+            return
+        if self.client.has_valid_programs_root():
+            try:
+                path = self.client.require_programs_root()
+            except SharePointCredentialError:
+                path_text = ""
+            else:
+                path_text = f"<b>{path}</b>"
+        else:
+            path_text = (
+                "<span style='color:#c0392b'>Nenhuma pasta configurada. "
+                "Clique em 'Alterar pasta...' para apontar para '[00] PROGRAMAS'.</span>"
+            )
+        if not path_text:
+            path_text = (
+                "<span style='color:#c0392b'>Defina a pasta '[00] PROGRAMAS' para listar os voos.</span>"
+            )
+        self.origin_path_label.setText(path_text)
+
+    def _change_origin_folder(self):
+        if self._is_busy:
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Selecione a pasta '[00] PROGRAMAS' sincronizada",
+            str(self.client.programs_root) if self.client.programs_root else "",
+        )
+        if not directory:
+            return
+        try:
+            self.client.set_programs_root(Path(directory))
+        except (FileNotFoundError, OSError) as exc:
+            QMessageBox.warning(self, "Pasta inválida", str(exc))
+            return
+        self._refresh_origin_path_label()
+        if self.stack.currentWidget() == self.selection_page and self.selected_program:
+            self._load_flights()
+
+    def _ensure_origin_configured(self) -> bool:
+        if self.client.has_valid_programs_root():
+            return True
+        QMessageBox.information(
+            self,
+            "Selecione a pasta do OneDrive",
+            (
+                "Para copiar os logs é preciso apontar para a pasta '[00] PROGRAMAS' "
+                "sincronizada no seu computador. Clique em 'Alterar pasta...' e selecione o local."
+            ),
+        )
+        self._change_origin_folder()
+        return self.client.has_valid_programs_root()
 
     # --------------------------- Programas -------------------------------
     def _load_program_icon(self, program: SharePointProgram) -> QIcon | None:
@@ -256,6 +323,8 @@ class LogDownloadDialog(QDialog):
         if not isinstance(program, SharePointProgram):
             return
         self.selected_program = program
+        if not self._ensure_origin_configured():
+            return
         self.program_title.setText(f"Programa selecionado: {program.name}")
         self.stack.setCurrentWidget(self.selection_page)
         self.btn_back.setEnabled(True)
@@ -273,12 +342,14 @@ class LogDownloadDialog(QDialog):
     def _load_flights(self):
         if not self.selected_program:
             return
+        if not self._ensure_origin_configured():
+            return
         self.flight_list.clear()
         self.all_flights = []
         self._set_busy_state(True)
         self.progress_bar.show()
         self.progress_bar.setRange(0, 0)
-        self.status_label.setText("Conectando ao SharePoint e listando voos...")
+        self.status_label.setText("Lendo a pasta local e listando voos...")
         self.btn_download.setEnabled(False)
 
         self.list_worker = SharePointListWorker(self.client, self.selected_program)
@@ -326,13 +397,15 @@ class LogDownloadDialog(QDialog):
         self.btn_close.setEnabled(not busy)
         self.btn_back.setEnabled(not busy and self.stack.currentWidget() == self.selection_page)
         self.btn_program_continue.setEnabled(not busy and bool(self.program_list.selectedItems()))
+        if self.btn_change_origin:
+            self.btn_change_origin.setEnabled(not busy)
         if not busy:
             self.progress_bar.setRange(0, 100)
 
     def _on_worker_error(self, message: str):
         self.progress_bar.hide()
         self._set_busy_state(False)
-        QMessageBox.critical(self, "Erro ao acessar o SharePoint", message)
+        QMessageBox.critical(self, "Erro ao ler a pasta de origem", message)
 
     # ------------------------------ Filtros ------------------------------
     def _apply_filters(self):
@@ -391,9 +464,11 @@ class LogDownloadDialog(QDialog):
     def _start_download(self):
         if self._is_busy:
             return
+        if not self._ensure_origin_configured():
+            return
         flights = self._selected_flights()
         if not flights:
-            QMessageBox.information(self, "Nada selecionado", "Escolha ao menos um voo para baixar.")
+            QMessageBox.information(self, "Nada selecionado", "Escolha ao menos um voo para copiar.")
             return
         destination = get_appdata_logs_dir(create=True)
         destination.mkdir(parents=True, exist_ok=True)
@@ -401,7 +476,7 @@ class LogDownloadDialog(QDialog):
         self.progress_bar.show()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.status_label.setText(f"Preparando download de {len(flights)} voos...")
+        self.status_label.setText(f"Preparando cópia de {len(flights)} voos...")
         self._set_busy_state(True)
 
         self.download_worker = SharePointDownloadWorker(self.client, flights, destination)
@@ -426,12 +501,12 @@ class LogDownloadDialog(QDialog):
         self._set_busy_state(False)
         self.progress_bar.hide()
         self.status_label.setText(
-            f"Download finalizado. {len(local_paths)} voos foram salvos na pasta de logs."
+            f"Cópia finalizada. {len(local_paths)} voos foram salvos na pasta de logs."
         )
         destination = self._current_destination or get_appdata_logs_dir(create=True)
         QMessageBox.information(
             self,
-            "Download concluído",
+            "Cópia concluída",
             f"{len(local_paths)} voos foram salvos em {destination}",
         )
         self.logs_downloaded.emit(destination, local_paths)

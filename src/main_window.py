@@ -170,7 +170,7 @@ class TelemetryApp(QMainWindow):
 
         self.btn_download_sharepoint = QPushButton("Baixar Novos Logs")
         self.btn_download_sharepoint.setToolTip(
-            "Busca automaticamente os voos publicados no SharePoint de Ensaios em Voo"
+            "Abre o assistente para copiar voos da pasta '[00] PROGRAMAS' sincronizada"
         )
         self.btn_download_sharepoint.clicked.connect(self.open_sharepoint_downloader)
         top_controls_layout.addWidget(self.btn_download_sharepoint)
@@ -312,8 +312,8 @@ class TelemetryApp(QMainWindow):
                     self,
                     "Configuração necessária",
                     (
-                        "Não foi possível iniciar o download automático.\n"
-                        "Verifique suas credenciais do SharePoint:\n"
+                        "Não foi possível localizar a pasta '[00] PROGRAMAS'.\n"
+                        "Configure o caminho correto no assistente de cópia.\n"
                         f"{exc}"
                     ),
                 )
@@ -322,7 +322,7 @@ class TelemetryApp(QMainWindow):
                 QMessageBox.critical(
                     self,
                     "Erro inesperado",
-                    f"Falha ao conectar no SharePoint:\n{exc}",
+                    f"Falha ao abrir o assistente de cópia:\n{exc}",
                 )
                 return
 
@@ -345,7 +345,7 @@ class TelemetryApp(QMainWindow):
         self.last_logs_root = Path(base_path)
         count = len(local_paths)
         self.statusBar().showMessage(
-            f"{count} novos voos foram baixados para {base_path}",
+            f"{count} novos voos foram copiados para {base_path}",
             8000,
         )
 
@@ -354,7 +354,7 @@ class TelemetryApp(QMainWindow):
 
         reply = QMessageBox.question(
             self,
-            "Download concluído",
+            "Cópia concluída",
             (
                 f"{count} voos foram salvos em:\n{base_path}\n\n"
                 "Deseja carregar essa pasta agora?"
