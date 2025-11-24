@@ -119,7 +119,11 @@ def _default_programs_root_candidates() -> List[Path]:
     candidates.append(home / "Departamento de Ensaios em voo" / "[00] PROGRAMAS")
     candidates.append(home / "[00] PROGRAMAS")
 
-    return _dedupe_paths([c for c in candidates if c])
+    deduped = _dedupe_paths([c for c in candidates if c])
+    print("[debug][programs_root] Candidatos detectados:")
+    for candidate in deduped:
+        print(f"  - {candidate}")
+    return deduped
 
 
 def _save_programs_root(path: Path) -> None:
@@ -139,6 +143,7 @@ class SharePointClient:
             for candidate in _default_programs_root_candidates():
                 if candidate.exists():
                     self.programs_root = candidate
+                    print(f"[debug][init] Usando pasta sincronizada detectada: {candidate}")
                     break
 
     def has_valid_programs_root(self) -> bool:
@@ -155,6 +160,7 @@ class SharePointClient:
         resolved = Path(path).expanduser()
         if not resolved.exists() or not resolved.is_dir():
             raise FileNotFoundError(f"Pasta inválida: {resolved}")
+        print(f"[debug][set_programs_root] Configurando pasta raiz para {resolved}")
         self.programs_root = resolved
         if persist:
             _save_programs_root(resolved)
@@ -162,10 +168,15 @@ class SharePointClient:
     def list_flights(self, program: SharePointProgram) -> List[SharePointFlight]:
         root = self.require_programs_root()
         ensaios_path = root / program.folder_name / SHAREPOINT_ENSAIOS_FOLDER
+        print(f"[debug][list_flights] Programa: {program.code}")
+        print(f"[debug][list_flights] Raiz dos programas: {root}")
+        print(f"[debug][list_flights] Pasta de ensaios esperada: {ensaios_path}")
         flights: List[SharePointFlight] = []
         if not ensaios_path.exists():
+            print("[debug][list_flights] Pasta de ensaios inexistente ou inacessível")
             return flights
         self._walk_program(program, root, ensaios_path, None, flights)
+        print(f"[debug][list_flights] Total de voos encontrados: {len(flights)}")
         flights.sort(key=lambda flight: (flight.date or datetime.min), reverse=True)
         return flights
 
@@ -178,8 +189,18 @@ class SharePointClient:
         flights: List[SharePointFlight],
     ) -> None:
         if not folder_path.exists():
+            print(f"[debug][_walk_program] Ignorando pasta inexistente: {folder_path}")
             return
-        for entry in sorted(folder_path.iterdir()):
+        try:
+            entries = sorted(folder_path.iterdir())
+        except PermissionError:
+            print(f"[debug][_walk_program] Sem permissão para acessar: {folder_path}")
+            return
+
+        print(f"[debug][_walk_program] Varredura em: {folder_path}")
+        for entry in entries:
+            kind = "dir" if entry.is_dir() else "file"
+            print(f"  [debug][_walk_program] Encontrado {kind}: {entry.name}")
             if not entry.is_dir():
                 continue
             name = entry.name
@@ -210,9 +231,12 @@ class SharePointClient:
     ) -> Path:
         root = self.require_programs_root()
         source_dir = root / flight.relative_path
+        print(f"[debug][download_flight] Copiando voo {flight.name}")
+        print(f"[debug][download_flight] Origem: {source_dir}")
         if not source_dir.exists():
             raise FileNotFoundError(f"Voo não encontrado em {source_dir}")
         target_dir = destination_root / flight.local_subpath()
+        print(f"[debug][download_flight] Destino: {target_dir}")
         self._copy_folder(source_dir, target_dir, progress_callback)
         return target_dir
 
@@ -223,11 +247,13 @@ class SharePointClient:
         progress_callback: Callable[[str], None] | None,
     ) -> None:
         destination.mkdir(parents=True, exist_ok=True)
+        print(f"[debug][_copy_folder] Copiando de {source} para {destination}")
         for entry in source.iterdir():
             target = destination / entry.name
             if entry.is_dir():
                 self._copy_folder(entry, target, progress_callback)
             elif entry.is_file():
+                print(f"  [debug][_copy_folder] Arquivo: {entry}")
                 shutil.copy2(entry, target)
                 if progress_callback:
                     progress_callback(entry.name)
