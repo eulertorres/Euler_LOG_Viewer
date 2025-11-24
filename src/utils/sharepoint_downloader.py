@@ -172,56 +172,17 @@ class SharePointClient:
         root = self.require_programs_root()
         flights: List[SharePointFlight] = []
 
-        def candidate_ensaios_dirs() -> List[tuple[Path, Path]]:
-            """Retorna pares (base_relativa, pasta_a_percorrer)."""
-
-            pairs: List[tuple[Path, Path]] = []
-            expected_program_dir = root / program.folder_name
-            if expected_program_dir.exists():
-                ensaios_dir = expected_program_dir / SHAREPOINT_ENSAIOS_FOLDER
-                pairs.append((root, ensaios_dir if ensaios_dir.exists() else expected_program_dir))
-
-            # Se o usuário escolheu direto a pasta do programa ou uma agenda/serial.
-            if root.name == program.folder_name or program.folder_name in root.parts:
-                ensaios_dir = root / SHAREPOINT_ENSAIOS_FOLDER
-                pairs.append((root, ensaios_dir if ensaios_dir.exists() else root))
-
-            if not pairs:
-                pairs.append((root, root))
-
-            deduped: List[tuple[Path, Path]] = []
-            seen = set()
-            for rel_base, scan_dir in pairs:
-                key = (str(rel_base), str(scan_dir))
-                if key in seen:
-                    continue
-                seen.add(key)
-                deduped.append((rel_base, scan_dir))
-            return deduped
-
         print(f"[debug][list_flights] Programa: {program.code}")
         print(f"[debug][list_flights] Raiz configurada: {root}")
+        print("[debug][list_flights] Varredura profunda em toda a pasta selecionada")
 
-        for rel_base, scan_dir in candidate_ensaios_dirs():
+        try:
+            self._walk_program(program, root, root, None, flights, root)
+        except Exception as exc:  # pragma: no cover - defensivo para logs ruins
             print(
-                "[debug][list_flights] Percorrendo a partir de",
-                f"base relativa={rel_base} | pasta de busca={scan_dir}",
+                "[debug][list_flights] Erro ao percorrer pastas; ignorando e mantendo o que já foi encontrado:",
+                exc,
             )
-            if not scan_dir.exists():
-                print(f"[debug][list_flights] Pasta inexistente: {scan_dir}")
-                continue
-            try:
-                ensaios_root = scan_dir
-                if scan_dir.name != SHAREPOINT_ENSAIOS_FOLDER:
-                    inner = scan_dir / SHAREPOINT_ENSAIOS_FOLDER
-                    if inner.exists():
-                        ensaios_root = inner
-                self._walk_program(program, rel_base, ensaios_root, None, flights, ensaios_root)
-            except Exception as exc:  # pragma: no cover - defensivo para logs ruins
-                print(
-                    "[debug][list_flights] Erro ao percorrer pastas; ignorando e mantendo o que já foi encontrado:",
-                    exc,
-                )
 
         print(f"[debug][list_flights] Total de voos encontrados: {len(flights)}")
         flights.sort(key=lambda flight: (flight.date or datetime.min), reverse=True)
@@ -252,6 +213,7 @@ class SharePointClient:
             if not entry.is_dir():
                 continue
             name = entry.name
+            added_as_flight = False
             match = FLIGHT_FOLDER_RE.match(name)
             if match:
                 try:
@@ -274,15 +236,16 @@ class SharePointClient:
                         log_types=tuple(sorted(log_types)) if has_logs else tuple(),
                     )
                 )
+                added_as_flight = True
                 if not has_logs:
                     print(
                         "  [debug][_walk_program] Pasta encaixa no padrão de voo, mas nenhum log foi "
                         "identificado; mantendo na lista com tipos vazios."
                     )
-                continue
+                # Ainda assim continuamos descendo, pois pode haver subpastas com logs adicionais.
 
             has_logs, log_types = self._folder_log_types(entry)
-            if has_logs:
+            if has_logs and not added_as_flight:
                 inferred_date = self._infer_date_from_name(name)
                 print(
                     "  [debug][_walk_program] Pasta tratada como voo por conter logs: "
@@ -298,14 +261,7 @@ class SharePointClient:
                         log_types=tuple(sorted(log_types)),
                     )
                 )
-                if folder_path == ensaios_root:
-                    # A pasta parece conter logs, mas pode agrupar vários voos; continue explorando.
-                    print(
-                        "  [debug][_walk_program] Descendo para identificar voos dentro do serial/agenda "
-                        f"{name}"
-                    )
-                else:
-                    continue
+                # Não interrompe a busca; subpastas podem conter outros voos ou logs.
 
             next_serial = serial_hint
             if folder_path == ensaios_root or name.upper().startswith("NS"):
@@ -315,7 +271,7 @@ class SharePointClient:
     def _folder_log_types(self, folder: Path) -> tuple[bool, set[str]]:
         try:
             found_types: set[str] = set()
-            for candidate in folder.rglob("*"):
+            for candidate in folder.iterdir():
                 if not candidate.is_file():
                     continue
                 suffix = candidate.suffix.lower()

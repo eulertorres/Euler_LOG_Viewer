@@ -294,7 +294,7 @@ class LogDownloadDialog(QDialog):
             return
         directory = QFileDialog.getExistingDirectory(
             self,
-            "Selecione a pasta sincronizada (pode ser '[00] PROGRAMAS', um programa ou agenda)",
+            "Selecione a pasta sincronizada (qualquer nível; buscaremos logs em todas as subpastas)",
             str(self.client.programs_root) if self.client.programs_root else "",
         )
         if not directory:
