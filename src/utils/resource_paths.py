@@ -63,13 +63,39 @@ def resource_path(*relative_parts: os.PathLike | str) -> Path:
     return _candidate_roots()[0] / relative_path
 
 
+def get_appdata_logs_dir(create: bool = True) -> Path:
+    """Retorna a pasta "Logs" dentro do AppData do usuário.
+
+    O caminho varia por sistema operacional, mas sempre termina em
+    ``XmobotsLogViewer/Logs``. Quando ``create`` é ``True`` a pasta é criada
+    automaticamente, caso ainda não exista.
+    """
+
+    if sys.platform.startswith("win"):
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path.home() / ".local" / "share"
+
+    logs_dir = base / "XmobotsLogViewer" / "Logs"
+    if create:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir
+
+
 def get_logs_directory() -> Path | None:
     """Tenta descobrir a pasta de logs padrão.
 
     Ordem de precedência:
-    1. Variável de ambiente XMOBOTS_LOG_DIR
-    2. Pasta "logs de teste" empacotada junto com o app
+    1. Pasta "Logs" no AppData do usuário
+    2. Variável de ambiente XMOBOTS_LOG_DIR
+    3. Pasta "logs de teste" empacotada junto com o app
     """
+
+    appdata_logs = get_appdata_logs_dir(create=True)
+    if appdata_logs.exists():
+        return appdata_logs
 
     env_dir = os.environ.get("XMOBOTS_LOG_DIR")
     if env_dir:

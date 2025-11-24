@@ -37,6 +37,8 @@ from src.widgets.custom_plot_widget import CustomPlotWidget
 from src.utils.local_server import MapServer
 from src.utils.pdf_reporter import PdfReportWorker
 from src.utils.resource_paths import get_logs_directory, resource_path
+from src.utils.sharepoint_downloader import SharePointClient, SharePointCredentialError
+from src.widgets.log_download_dialog import LogDownloadDialog
 
 AIRCRAFT_ICON_PATH = resource_path('aircraft.svg')
 WIND_ICON_PATH = resource_path('seta.svg')
@@ -122,6 +124,9 @@ class TelemetryApp(QMainWindow):
 
         self.setup_ui()
 
+        self.sharepoint_client: SharePointClient | None = None
+        self.log_download_dialog: LogDownloadDialog | None = None
+
     def _register_static_assets(self):
         self.aircraft_icon_filename = self.copy_assets_to_server(AIRCRAFT_ICON_PATH)
         self.wind_icon_filename = self.copy_assets_to_server(WIND_ICON_PATH)
@@ -162,6 +167,14 @@ class TelemetryApp(QMainWindow):
         self.btn_open = QPushButton("Selecionar Diretório Raiz dos Logs")
         self.btn_open.clicked.connect(self.open_log_directories)
         top_controls_layout.addWidget(self.btn_open)
+
+        self.btn_download_sharepoint = QPushButton("Baixar Novos Logs")
+        self.btn_download_sharepoint.setToolTip(
+            "Abre o assistente para copiar voos da pasta '[00] PROGRAMAS' sincronizada"
+        )
+        self.btn_download_sharepoint.clicked.connect(self.open_sharepoint_downloader)
+        top_controls_layout.addWidget(self.btn_download_sharepoint)
+
         top_controls_layout.addWidget(QLabel("Log Ativo para Visualização:"))
         self.log_selector_combo = QComboBox()
         self.log_selector_combo.currentTextChanged.connect(self._on_log_selected)
@@ -290,6 +303,66 @@ class TelemetryApp(QMainWindow):
 
         self._start_loading_from_path(root_path)
 
+    def open_sharepoint_downloader(self):
+        if self.sharepoint_client is None:
+            try:
+                self.sharepoint_client = SharePointClient()
+            except SharePointCredentialError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Configuração necessária",
+                    (
+                        "Não foi possível localizar a pasta '[00] PROGRAMAS'.\n"
+                        "Configure o caminho correto no assistente de cópia.\n"
+                        f"{exc}"
+                    ),
+                )
+                return
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Erro inesperado",
+                    f"Falha ao abrir o assistente de cópia:\n{exc}",
+                )
+                return
+
+        if self.log_download_dialog is None:
+            self.log_download_dialog = LogDownloadDialog(self.sharepoint_client, self)
+            self.log_download_dialog.logs_downloaded.connect(self.on_logs_downloaded_from_sharepoint)
+            self.log_download_dialog.destroyed.connect(self._on_log_download_dialog_destroyed)
+
+        self.log_download_dialog.show()
+        self.log_download_dialog.raise_()
+        self.log_download_dialog.activateWindow()
+
+    def _on_log_download_dialog_destroyed(self, _obj=None):
+        self.log_download_dialog = None
+
+    def on_logs_downloaded_from_sharepoint(self, base_path: Path, local_paths: list[Path]):
+        if not base_path:
+            return
+
+        self.last_logs_root = Path(base_path)
+        count = len(local_paths)
+        self.statusBar().showMessage(
+            f"{count} novos voos foram copiados para {base_path}",
+            8000,
+        )
+
+        if count == 0:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Cópia concluída",
+            (
+                f"{count} voos foram salvos em:\n{base_path}\n\n"
+                "Deseja carregar essa pasta agora?"
+            ),
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_loading_from_path(str(base_path))
+
     def _start_loading_from_path(self, root_path):
         if not root_path:
             return
@@ -416,32 +489,40 @@ class TelemetryApp(QMainWindow):
         self.current_log_name = log_name
         self.df = self.log_data[log_name]
 
-        if self.standard_plots_tab: self.standard_plots_tab.load_dataframe(self.df, self.current_log_name)
-        if self.all_plots_tab: self.all_plots_tab.load_dataframe(self.df, self.current_log_name)
-        # O custom_plot_tab já recebe todos os logs no on_loading_finished
+        self.loading_widget.start_animation()
+        self.loading_widget.open()
+        QApplication.processEvents()
 
-        if self.tabs and self.standard_plots_tab:
-            self.tabs.setCurrentWidget(self.standard_plots_tab)
-            self.standard_plots_tab.show_position_plot()
+        try:
+            if self.standard_plots_tab: self.standard_plots_tab.load_dataframe(self.df, self.current_log_name)
+            if self.all_plots_tab: self.all_plots_tab.load_dataframe(self.df, self.current_log_name)
+            # O custom_plot_tab já recebe todos os logs no on_loading_finished
 
-        self.plot_map_route() # Recria o mapa
-        self.setup_timeline()
+            if self.tabs and self.standard_plots_tab:
+                self.tabs.setCurrentWidget(self.standard_plots_tab)
+                self.standard_plots_tab.show_position_plot()
 
-        self.map_stack.setCurrentWidget(self.mapWidget)
-        self.view_toggle_checkbox.blockSignals(True)
-        self.view_toggle_checkbox.setChecked(False)
-        self.view_toggle_checkbox.blockSignals(False)
-        self.cesium_state = None
-        self.cesium_ready = False
-        self.cesium_start_timestamp = None
-        self.cleanup_cesium_html()
+            self.plot_map_route() # Recria o mapa
+            self.setup_timeline()
 
-        cesium_state = self.build_cesium_state_from_dataframe()
-        if cesium_state:
-            self.cesium_state = cesium_state
-            self.view_toggle_checkbox.setEnabled(True)
-        else:
-            self.view_toggle_checkbox.setEnabled(False)
+            self.map_stack.setCurrentWidget(self.mapWidget)
+            self.view_toggle_checkbox.blockSignals(True)
+            self.view_toggle_checkbox.setChecked(False)
+            self.view_toggle_checkbox.blockSignals(False)
+            self.cesium_state = None
+            self.cesium_ready = False
+            self.cesium_start_timestamp = None
+            self.cleanup_cesium_html()
+
+            cesium_state = self.build_cesium_state_from_dataframe()
+            if cesium_state:
+                self.cesium_state = cesium_state
+                self.view_toggle_checkbox.setEnabled(True)
+            else:
+                self.view_toggle_checkbox.setEnabled(False)
+        finally:
+            self.loading_widget.stop_animation()
+            self.loading_widget.close()
 
     # --- Funções do Mapa e Timeline ---
     
@@ -867,16 +948,22 @@ class TelemetryApp(QMainWindow):
         self.timestamp_label.setText(f"Timestamp: {timestamp.strftime('%H:%M:%S.%f')[:-3]}")
         
         if 'Latitude' in data_row and 'Longitude' in data_row:
-            yaw = data_row.get('Yaw', 0)            # Pega Yaw, default 0
-            lat = data_row.get('Latitude')          # Pega a lat
-            lon = data_row.get('Longitude')         # Pega a long
-            win = data_row.get('WindDirection', 0)  # Pega o windD
-            wsi = data_row.get('WSI', 0)            # Pega o vento
-            if not pd.notna(yaw): yaw = 0 # Trata NaN
+            yaw_raw = data_row.get('Yaw', 0)            # Pega Yaw, default 0
+            lat = data_row.get('Latitude')              # Pega a lat
+            lon = data_row.get('Longitude')             # Pega a long
+            win = data_row.get('WindDirection', 0)      # Pega o windD
+            wsi = data_row.get('WSI', 0)                # Pega o vento
+
+            try:
+                yaw = float(yaw_raw) if pd.notna(yaw_raw) else 0
+                # Alguns logs trazem yaw em radianos; converte para graus se for pequeno.
+                if abs(yaw) <= (2 * math.pi + 0.001):
+                    yaw = math.degrees(yaw)
+            except Exception:
+                yaw = 0
+
             if not pd.notna(win): win = 0 # Trata NaN
             if not pd.notna(wsi): wsi = 0 # Trata NaN
-
-            #print(f"DEBUG do YAW: {yaw}")
 
             self.update_aircraft_position(lat, lon, yaw, win, wsi)
 
