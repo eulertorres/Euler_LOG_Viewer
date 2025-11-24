@@ -12,8 +12,9 @@ from typing import Callable, List, Sequence
 
 SHAREPOINT_ENSAIOS_FOLDER = "[01] Ensaios"
 FLIGHT_FOLDER_RE = re.compile(
-    r"^(?P<class>[A-Z]{2})(?P<program>[A-Z0-9]{2})-(?P<date>\d{8})-(?P<flight>\d+)-(?P<serial>[A-Za-z0-9]+)$"
+    r"^(?P<class>[A-Z]{2})(?P<program>[A-Z0-9]{2})-(?P<date>\d{8})-(?P<flight>\d+)-(?P<serial>[A-Za-z0-9_.-]+)$"
 )
+SUPPORTED_LOG_EXTS = {".mat", ".log", ".csv"}
 CONFIG_DIR = Path.home() / ".config" / "xmobots"
 PROGRAMS_ROOT_FILE = CONFIG_DIR / "programs_root.json"
 PROGRAMS_ROOT_KEY = "programs_root"
@@ -175,7 +176,7 @@ class SharePointClient:
         if not ensaios_path.exists():
             print("[debug][list_flights] Pasta de ensaios inexistente ou inacessível")
             return flights
-        self._walk_program(program, root, ensaios_path, None, flights)
+        self._walk_program(program, root, ensaios_path, None, flights, ensaios_path)
         print(f"[debug][list_flights] Total de voos encontrados: {len(flights)}")
         flights.sort(key=lambda flight: (flight.date or datetime.min), reverse=True)
         return flights
@@ -187,6 +188,7 @@ class SharePointClient:
         folder_path: Path,
         serial_hint: str | None,
         flights: List[SharePointFlight],
+        ensaios_root: Path,
     ) -> None:
         if not folder_path.exists():
             print(f"[debug][_walk_program] Ignorando pasta inexistente: {folder_path}")
@@ -207,6 +209,7 @@ class SharePointClient:
             match = FLIGHT_FOLDER_RE.match(name)
             if match:
                 date = datetime.strptime(match.group("date"), "%Y%m%d")
+                print(f"  [debug][_walk_program] Pasta de voo detectada por padrão: {name}")
                 flights.append(
                     SharePointFlight(
                         program=program,
@@ -218,10 +221,48 @@ class SharePointClient:
                 )
                 continue
 
+            if self._folder_has_logs(entry):
+                inferred_date = self._infer_date_from_name(name)
+                print(
+                    "  [debug][_walk_program] Pasta tratada como voo por conter logs: "
+                    f"{name} (data inferida: {inferred_date})"
+                )
+                flights.append(
+                    SharePointFlight(
+                        program=program,
+                        name=name,
+                        relative_path=entry.relative_to(root),
+                        serial_folder=serial_hint,
+                        date=inferred_date,
+                    )
+                )
+                continue
+
             next_serial = serial_hint
-            if name.upper().startswith("NS"):
+            if folder_path == ensaios_root or name.upper().startswith("NS"):
                 next_serial = name
-            self._walk_program(program, root, entry, next_serial, flights)
+            self._walk_program(program, root, entry, next_serial, flights, ensaios_root)
+
+    def _folder_has_logs(self, folder: Path) -> bool:
+        try:
+            for candidate in folder.rglob("*"):
+                if not candidate.is_file():
+                    continue
+                if candidate.suffix.lower() in SUPPORTED_LOG_EXTS:
+                    print(f"  [debug][_walk_program] Arquivo de log identificado: {candidate}")
+                    return True
+        except PermissionError:
+            print(f"  [debug][_walk_program] Sem permissão para inspecionar logs em: {folder}")
+        return False
+
+    def _infer_date_from_name(self, name: str) -> datetime | None:
+        date_match = re.search(r"(\d{8})", name)
+        if not date_match:
+            return None
+        try:
+            return datetime.strptime(date_match.group(1), "%Y%m%d")
+        except ValueError:
+            return None
 
     def download_flight(
         self,
