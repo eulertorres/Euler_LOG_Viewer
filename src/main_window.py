@@ -106,6 +106,7 @@ class TelemetryApp(QMainWindow):
         self.cesium_plane_asset = os.path.join('assets', 'cesium', 'plane.glb')
         self.cesium_controls_container = None
         self.cesium_center_button = None
+        self.cesium_follow_checkbox = None
         self.cesium_imagery_combo = None
         self.cesium_imagery_presets = [
             {
@@ -134,6 +135,7 @@ class TelemetryApp(QMainWindow):
             }
         ]
         self.current_cesium_imagery_key = self.cesium_imagery_presets[0]["key"] if self.cesium_imagery_presets else "osm"
+        self.altitude_reference = 0.0
 
         self.copy_assets_to_server(icone_aviao)
         self.copy_assets_to_server(icone_seta)
@@ -236,6 +238,10 @@ class TelemetryApp(QMainWindow):
         self.cesium_imagery_combo = QComboBox()
         self.cesium_imagery_combo.currentIndexChanged.connect(self.on_cesium_imagery_changed)
         cesium_controls_layout.addWidget(self.cesium_imagery_combo, 1)
+        self.cesium_follow_checkbox = QCheckBox("Seguir")
+        self.cesium_follow_checkbox.setChecked(True)
+        self.cesium_follow_checkbox.stateChanged.connect(self.on_cesium_follow_changed)
+        cesium_controls_layout.addWidget(self.cesium_follow_checkbox)
         self.cesium_center_button = QPushButton("Centralizar no drone")
         self.cesium_center_button.clicked.connect(self.center_cesium_camera)
         self.cesium_center_button.setEnabled(False)
@@ -246,8 +252,8 @@ class TelemetryApp(QMainWindow):
         self.map_stack = QStackedWidget()
         self.map_stack.addWidget(self.mapWidget)
         self.map_stack.addWidget(self.cesiumWidget)
-        map_panel_layout.addWidget(self.cesium_controls_container)
         map_panel_layout.addWidget(self.map_stack, 1)
+        map_panel_layout.addWidget(self.cesium_controls_container)
         self.map_stack.setCurrentWidget(self.mapWidget)
         self.populate_cesium_imagery_combo()
 
@@ -413,6 +419,7 @@ class TelemetryApp(QMainWindow):
         if not log_name or log_name not in self.log_data: return
         self.current_log_name = log_name
         self.df = self.log_data[log_name]
+        self._update_altitude_reference()
 
         if self.standard_plots_tab: self.standard_plots_tab.load_dataframe(self.df, self.current_log_name)
         if self.all_plots_tab: self.all_plots_tab.load_dataframe(self.df)
@@ -687,6 +694,12 @@ class TelemetryApp(QMainWindow):
             self.cesium_center_button.setEnabled(show_controls and self.cesium_is_ready)
         if self.cesium_imagery_combo:
             self.cesium_imagery_combo.setEnabled(show_controls)
+        if self.cesium_follow_checkbox:
+            self.cesium_follow_checkbox.setEnabled(show_controls and self.cesium_is_ready)
+            if not show_controls:
+                self.cesium_follow_checkbox.blockSignals(True)
+                self.cesium_follow_checkbox.setChecked(True)
+                self.cesium_follow_checkbox.blockSignals(False)
 
     def create_cesium_viewer_html(self):
         try:
@@ -696,6 +709,8 @@ class TelemetryApp(QMainWindow):
             plane_literal = json.dumps(plane_url)
             imagery_config_literal = json.dumps(self.cesium_imagery_presets)
             default_imagery_key = json.dumps(self.current_cesium_imagery_key)
+            route_positions = self._build_cesium_route_positions()
+            route_positions_literal = json.dumps(route_positions)
             html_template = Template("""<!DOCTYPE html>
 <html lang='pt-BR'>
 <head>
@@ -830,6 +845,7 @@ class TelemetryApp(QMainWindow):
             function radiansOrZero(valueDeg) {
                 return Cesium.Math.toRadians(Number.isFinite(valueDeg) ? valueDeg : 0.0);
             }
+            const headingOffset = Cesium.Math.toRadians(-90.0);
             window.updateAircraftState = function(lat, lon, alt, headingDeg, pitchDeg, rollDeg) {
                 if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
                     return;
@@ -837,7 +853,7 @@ class TelemetryApp(QMainWindow):
                 const safeAlt = Number.isFinite(alt) ? alt : 0.0;
                 const position = Cesium.Cartesian3.fromDegrees(lon, lat, safeAlt);
                 aircraftEntity.position = position;
-                scratchHPR.heading = radiansOrZero(headingDeg);
+                scratchHPR.heading = radiansOrZero(headingDeg) + headingOffset;
                 scratchHPR.pitch = radiansOrZero(pitchDeg);
                 scratchHPR.roll = radiansOrZero(rollDeg);
                 aircraftEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(position, scratchHPR);
@@ -847,11 +863,69 @@ class TelemetryApp(QMainWindow):
                 if (!aircraftEntity) {
                     return;
                 }
+                if (window.__followEnabled !== false) {
+                    viewer.trackedEntity = aircraftEntity;
+                }
                 viewer.flyTo(aircraftEntity, {
                     duration: 0.6,
                     offset: new Cesium.HeadingPitchRange(0.0, -0.5, 150.0)
                 });
             };
+            window.setFollowMode = function(enabled) {
+                window.__followEnabled = !!enabled;
+                viewer.trackedEntity = enabled ? aircraftEntity : undefined;
+            };
+            const routePositions = $ROUTE_POSITIONS_JSON;
+            const completedPath = viewer.entities.add({
+                polyline: {
+                    positions: [],
+                    width: 3,
+                    material: new Cesium.PolylineGlowMaterialProperty({
+                        glowPower: 0.08,
+                        color: Cesium.Color.CYAN.withAlpha(0.85)
+                    })
+                }
+            });
+            const upcomingPath = viewer.entities.add({
+                polyline: {
+                    positions: [],
+                    width: 3,
+                    material: Cesium.Color.CYAN.withAlpha(0.18)
+                }
+            });
+            function toCartesian(pts) {
+                const arr = [];
+                for (const p of pts) {
+                    if (!p) continue;
+                    arr.push(p.lon, p.lat, p.alt);
+                }
+                return arr.length ? Cesium.Cartesian3.fromDegreesArrayHeights(arr) : [];
+            }
+            window.updateRouteProgress = function(index) {
+                if (!Array.isArray(routePositions) || !routePositions.length) {
+                    return;
+                }
+                const clamped = Math.max(0, Math.min(routePositions.length, index + 1));
+                const done = routePositions.slice(0, clamped);
+                const nextSegment = routePositions.slice(Math.max(0, clamped - 1));
+                completedPath.polyline.positions = toCartesian(done);
+                upcomingPath.polyline.positions = toCartesian(nextSegment);
+            };
+            const initialPos = routePositions.find(p => !!p);
+            if (initialPos) {
+                const startPosition = Cesium.Cartesian3.fromDegrees(initialPos.lon, initialPos.lat, initialPos.alt);
+                aircraftEntity.position = startPosition;
+                aircraftEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(
+                    startPosition,
+                    new Cesium.HeadingPitchRoll()
+                );
+                viewer.trackedEntity = aircraftEntity;
+                window.__followEnabled = true;
+                window.updateRouteProgress(0);
+            } else {
+                viewer.trackedEntity = aircraftEntity;
+                window.__followEnabled = true;
+            }
             window.__cesiumViewerReady = true;
         })();
     </script>
@@ -861,7 +935,8 @@ class TelemetryApp(QMainWindow):
             html_content = html_template.substitute(
                 PLANE_LITERAL=plane_literal,
                 IMAGERY_CONFIG_JSON=imagery_config_literal,
-                DEFAULT_IMAGERY_KEY=default_imagery_key
+                DEFAULT_IMAGERY_KEY=default_imagery_key,
+                ROUTE_POSITIONS_JSON=route_positions_literal
             )
             output_name = f"cesium_view_{int(time.time()*1000)}.html"
             output_path = os.path.join(self.map_server.get_temp_dir(), output_name)
@@ -895,6 +970,10 @@ class TelemetryApp(QMainWindow):
                 self.update_cesium_imagery_layer(self.current_cesium_imagery_key)
                 self._update_cesium_controls_state()
                 self.update_views_from_timeline(self.timeline_slider.value())
+                if self.cesium_follow_checkbox:
+                    self.cesium_follow_checkbox.blockSignals(True)
+                    self.cesium_follow_checkbox.setChecked(True)
+                    self.cesium_follow_checkbox.blockSignals(False)
             elif retries > 0:
                 QTimer.singleShot(200, lambda: self._wait_for_cesium_ready(retries - 1))
             else:
@@ -934,20 +1013,23 @@ class TelemetryApp(QMainWindow):
             roll = data_row.get('Roll', 0)
             lat = data_row.get('Latitude')          # Pega a lat
             lon = data_row.get('Longitude')         # Pega a long
-            alt = data_row.get('AltitudeAbs', 0)    # Altitude absoluta
+            alt_abs = data_row.get('AltitudeAbs', 0)    # Altitude absoluta
             win = data_row.get('WindDirection', 0)  # Pega o windD
             wsi = data_row.get('WSI', 0)            # Pega o vento
             if not pd.notna(yaw): yaw = 0 # Trata NaN
             if not pd.notna(pitch): pitch = 0
             if not pd.notna(roll): roll = 0
-            if not pd.notna(alt): alt = 0
+            if not pd.notna(alt_abs): alt_abs = 0
             if not pd.notna(win): win = 0 # Trata NaN
             if not pd.notna(wsi): wsi = 0 # Trata NaN
 
             #print(f"DEBUG do YAW: {yaw}")
 
+            alt_rel = self._compute_relative_altitude(alt_abs)
+
             self.update_aircraft_position(lat, lon, yaw, win, wsi)
-            self.update_cesium_aircraft(lat, lon, alt, yaw, pitch, roll)
+            self.update_cesium_aircraft(lat, lon, alt_rel, yaw, pitch, roll)
+            self.update_cesium_route_progress(index)
 
     def update_plot_cursors_on_release(self):
         """Chamado quando o slider é SOLTO. Atualiza os cursores dos gráficos."""
@@ -990,6 +1072,60 @@ class TelemetryApp(QMainWindow):
             "}"
         )
         self.cesiumWidget.page().runJavaScript(js_code)
+
+    def update_cesium_route_progress(self, index):
+        if not self.cesium_is_ready or self.cesiumWidget is None:
+            return
+        js_code = (
+            "if (typeof updateRouteProgress === 'function') {"
+            f"updateRouteProgress({index});"
+            "}"
+        )
+        self.cesiumWidget.page().runJavaScript(js_code)
+
+    def on_cesium_follow_changed(self, state):
+        enabled = Qt.CheckState(state) == Qt.CheckState.Checked
+        if not self.cesium_is_ready or self.cesiumWidget is None:
+            return
+        js_code = (
+            "if (typeof setFollowMode === 'function') {"
+            f"setFollowMode({str(enabled).lower()});"
+            "}"
+        )
+        self.cesiumWidget.page().runJavaScript(js_code)
+
+    def _compute_relative_altitude(self, alt_abs):
+        if not pd.notna(alt_abs):
+            return 0.0
+        if self.altitude_reference is None:
+            self.altitude_reference = float(alt_abs)
+        return max(0.0, float(alt_abs) - float(self.altitude_reference))
+
+    def _update_altitude_reference(self):
+        if self.df.empty or 'AltitudeAbs' not in self.df.columns:
+            self.altitude_reference = 0.0
+            return
+        first_valid = self.df['AltitudeAbs'].dropna()
+        self.altitude_reference = float(first_valid.iloc[0]) if not first_valid.empty else 0.0
+
+    def _build_cesium_route_positions(self):
+        positions = []
+        if self.df.empty:
+            return positions
+        for _, row in self.df.iterrows():
+            lat = row.get('Latitude') if 'Latitude' in row else None
+            lon = row.get('Longitude') if 'Longitude' in row else None
+            alt_abs = row.get('AltitudeAbs') if 'AltitudeAbs' in row else None
+            if pd.notna(lat) and pd.notna(lon):
+                alt_rel = self._compute_relative_altitude(alt_abs)
+                positions.append({
+                    'lat': float(lat),
+                    'lon': float(lon),
+                    'alt': float(alt_rel)
+                })
+            else:
+                positions.append(None)
+        return positions
 
     def set_timestamp_manually(self):
         if self.df.empty: return
