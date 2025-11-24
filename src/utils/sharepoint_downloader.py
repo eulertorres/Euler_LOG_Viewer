@@ -155,7 +155,7 @@ class SharePointClient:
     def require_programs_root(self) -> Path:
         if not self.has_valid_programs_root():
             raise SharePointCredentialError(
-                "Selecione a pasta '[00] PROGRAMAS' sincronizada com o SharePoint no OneDrive."
+                "Selecione a pasta sincronizada (pode ser '[00] PROGRAMAS', um programa ou uma agenda)."
             )
         return Path(self.programs_root)
 
@@ -170,21 +170,59 @@ class SharePointClient:
 
     def list_flights(self, program: SharePointProgram) -> List[SharePointFlight]:
         root = self.require_programs_root()
-        ensaios_path = root / program.folder_name / SHAREPOINT_ENSAIOS_FOLDER
-        print(f"[debug][list_flights] Programa: {program.code}")
-        print(f"[debug][list_flights] Raiz dos programas: {root}")
-        print(f"[debug][list_flights] Pasta de ensaios esperada: {ensaios_path}")
         flights: List[SharePointFlight] = []
-        if not ensaios_path.exists():
-            print("[debug][list_flights] Pasta de ensaios inexistente ou inacessível")
-            return flights
-        try:
-            self._walk_program(program, root, ensaios_path, None, flights, ensaios_path)
-        except Exception as exc:  # pragma: no cover - defensivo para logs ruins
+
+        def candidate_ensaios_dirs() -> List[tuple[Path, Path]]:
+            """Retorna pares (base_relativa, pasta_a_percorrer)."""
+
+            pairs: List[tuple[Path, Path]] = []
+            expected_program_dir = root / program.folder_name
+            if expected_program_dir.exists():
+                ensaios_dir = expected_program_dir / SHAREPOINT_ENSAIOS_FOLDER
+                pairs.append((root, ensaios_dir if ensaios_dir.exists() else expected_program_dir))
+
+            # Se o usuário escolheu direto a pasta do programa ou uma agenda/serial.
+            if root.name == program.folder_name or program.folder_name in root.parts:
+                ensaios_dir = root / SHAREPOINT_ENSAIOS_FOLDER
+                pairs.append((root, ensaios_dir if ensaios_dir.exists() else root))
+
+            if not pairs:
+                pairs.append((root, root))
+
+            deduped: List[tuple[Path, Path]] = []
+            seen = set()
+            for rel_base, scan_dir in pairs:
+                key = (str(rel_base), str(scan_dir))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append((rel_base, scan_dir))
+            return deduped
+
+        print(f"[debug][list_flights] Programa: {program.code}")
+        print(f"[debug][list_flights] Raiz configurada: {root}")
+
+        for rel_base, scan_dir in candidate_ensaios_dirs():
             print(
-                "[debug][list_flights] Erro ao percorrer pastas; ignorando e mantendo o que já foi encontrado:",
-                exc,
+                "[debug][list_flights] Percorrendo a partir de",
+                f"base relativa={rel_base} | pasta de busca={scan_dir}",
             )
+            if not scan_dir.exists():
+                print(f"[debug][list_flights] Pasta inexistente: {scan_dir}")
+                continue
+            try:
+                ensaios_root = scan_dir
+                if scan_dir.name != SHAREPOINT_ENSAIOS_FOLDER:
+                    inner = scan_dir / SHAREPOINT_ENSAIOS_FOLDER
+                    if inner.exists():
+                        ensaios_root = inner
+                self._walk_program(program, rel_base, ensaios_root, None, flights, ensaios_root)
+            except Exception as exc:  # pragma: no cover - defensivo para logs ruins
+                print(
+                    "[debug][list_flights] Erro ao percorrer pastas; ignorando e mantendo o que já foi encontrado:",
+                    exc,
+                )
+
         print(f"[debug][list_flights] Total de voos encontrados: {len(flights)}")
         flights.sort(key=lambda flight: (flight.date or datetime.min), reverse=True)
         return flights

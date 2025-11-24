@@ -95,7 +95,7 @@ class LogDownloadDialog(QDialog):
     def __init__(self, client: SharePointClient, parent=None):
         super().__init__(parent)
         self.client = client
-        self.setWindowTitle("Copiar logs da pasta PROGRAMAS")
+        self.setWindowTitle("Copiar logs da pasta sincronizada")
         self.resize(1000, 720)
 
         self.programs = list(available_programs())
@@ -146,7 +146,7 @@ class LogDownloadDialog(QDialog):
 
         origin_box = QGroupBox("Origem dos arquivos")
         origin_layout = QHBoxLayout(origin_box)
-        origin_layout.addWidget(QLabel("Pasta '[00] PROGRAMAS':"))
+        origin_layout.addWidget(QLabel("Pasta sincronizada:"))
         self.origin_path_label = QLabel()
         self.origin_path_label.setWordWrap(True)
         origin_layout.addWidget(self.origin_path_label, 1)
@@ -281,11 +281,11 @@ class LogDownloadDialog(QDialog):
         else:
             path_text = (
                 "<span style='color:#c0392b'>Nenhuma pasta configurada. "
-                "Clique em 'Alterar pasta...' para apontar para '[00] PROGRAMAS'.</span>"
+                "Clique em 'Alterar pasta...' para apontar para a pasta sincronizada.</span>"
             )
         if not path_text:
             path_text = (
-                "<span style='color:#c0392b'>Defina a pasta '[00] PROGRAMAS' para listar os voos.</span>"
+                "<span style='color:#c0392b'>Defina a pasta sincronizada para listar os voos.</span>"
             )
         self.origin_path_label.setText(path_text)
 
@@ -294,7 +294,7 @@ class LogDownloadDialog(QDialog):
             return
         directory = QFileDialog.getExistingDirectory(
             self,
-            "Selecione a pasta '[00] PROGRAMAS' sincronizada",
+            "Selecione a pasta sincronizada (pode ser '[00] PROGRAMAS', um programa ou agenda)",
             str(self.client.programs_root) if self.client.programs_root else "",
         )
         if not directory:
@@ -315,8 +315,9 @@ class LogDownloadDialog(QDialog):
             self,
             "Selecione a pasta do OneDrive",
             (
-                "Para copiar os logs é preciso apontar para a pasta '[00] PROGRAMAS' "
-                "sincronizada no seu computador. Clique em 'Alterar pasta...' e selecione o local."
+                "Para copiar os logs é preciso apontar para a pasta sincronizada no seu computador. "
+                "Ela pode ser '[00] PROGRAMAS', a pasta de um programa específico ou uma agenda. "
+                "Clique em 'Alterar pasta...' e selecione o local."
             ),
         )
         self._change_origin_folder()

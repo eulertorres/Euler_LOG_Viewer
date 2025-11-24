@@ -426,8 +426,10 @@ class TelemetryApp(QMainWindow):
         self.loading_status_widget.hide() # Esconde barra e texto
         self.setWindowTitle(self.original_window_title) # Restaura título
         self.btn_open.setEnabled(True) # Reabilita botão
-        
+
         if not loaded_logs:
+            self.loading_widget.stop_animation()
+            self.loading_widget.close()
             QMessageBox.information(self, "NUM TEM Log", "Você que fez errado, lê direito vei, É a pasta que tem as pastas de .log")
             self.statusBar().showMessage("NAO TEM LOGGGGG AAAAAA", 5000)
             self.btn_open.setEnabled(True)
@@ -443,11 +445,14 @@ class TelemetryApp(QMainWindow):
         self.loading_widget.close()
 
     def on_loading_error(self, error_message):
-        
+
         self.loading_status_widget.hide()
         self.setWindowTitle(self.original_window_title)
-        self.btn_open.setEnabled(True)    
-        
+        self.btn_open.setEnabled(True)
+
+        self.loading_widget.stop_animation()
+        self.loading_widget.close()
+
         QMessageBox.critical(self, "Não consigo ler :( help", error_message)
         self.statusBar().showMessage("Etaporra deu ruim em carregar os logs", 5000)
         #self.btn_open.setEnabled(True)
