@@ -39,6 +39,7 @@ class SharePointFlight:
     relative_path: Path
     serial_folder: str | None
     date: datetime | None
+    log_types: tuple[str, ...] = ()
 
     def local_subpath(self) -> Path:
         parts = [self.program.code]
@@ -50,7 +51,8 @@ class SharePointFlight:
     def human_label(self) -> str:
         date_text = self.date.strftime("%d/%m/%Y") if self.date else "Data desconhecida"
         serial = self.serial_folder or "Serial não identificado"
-        return f"{self.name} — {serial} — {date_text}"
+        log_text = ", ".join(self.log_types) if self.log_types else "Nenhum log reconhecido"
+        return f"{self.name} — {serial} — {date_text} — Logs: {log_text}"
 
 
 DEFAULT_PROGRAMS: Sequence[SharePointProgram] = (
@@ -210,6 +212,7 @@ class SharePointClient:
             if match:
                 date = datetime.strptime(match.group("date"), "%Y%m%d")
                 print(f"  [debug][_walk_program] Pasta de voo detectada por padrão: {name}")
+                has_logs, log_types = self._folder_log_types(entry)
                 flights.append(
                     SharePointFlight(
                         program=program,
@@ -217,11 +220,18 @@ class SharePointClient:
                         relative_path=entry.relative_to(root),
                         serial_folder=serial_hint,
                         date=date,
+                        log_types=tuple(sorted(log_types)) if has_logs else tuple(),
                     )
                 )
+                if not has_logs:
+                    print(
+                        "  [debug][_walk_program] Pasta encaixa no padrão de voo, mas nenhum log foi "
+                        "identificado; mantendo na lista com tipos vazios."
+                    )
                 continue
 
-            if self._folder_has_logs(entry):
+            has_logs, log_types = self._folder_log_types(entry)
+            if has_logs:
                 inferred_date = self._infer_date_from_name(name)
                 print(
                     "  [debug][_walk_program] Pasta tratada como voo por conter logs: "
@@ -234,26 +244,37 @@ class SharePointClient:
                         relative_path=entry.relative_to(root),
                         serial_folder=serial_hint,
                         date=inferred_date,
+                        log_types=tuple(sorted(log_types)),
                     )
                 )
-                continue
+                if folder_path == ensaios_root:
+                    # A pasta parece conter logs, mas pode agrupar vários voos; continue explorando.
+                    print(
+                        "  [debug][_walk_program] Descendo para identificar voos dentro do serial/agenda "
+                        f"{name}"
+                    )
+                else:
+                    continue
 
             next_serial = serial_hint
             if folder_path == ensaios_root or name.upper().startswith("NS"):
                 next_serial = name
             self._walk_program(program, root, entry, next_serial, flights, ensaios_root)
 
-    def _folder_has_logs(self, folder: Path) -> bool:
+    def _folder_log_types(self, folder: Path) -> tuple[bool, set[str]]:
         try:
+            found_types: set[str] = set()
             for candidate in folder.rglob("*"):
                 if not candidate.is_file():
                     continue
-                if candidate.suffix.lower() in SUPPORTED_LOG_EXTS:
+                suffix = candidate.suffix.lower()
+                if suffix in SUPPORTED_LOG_EXTS:
                     print(f"  [debug][_walk_program] Arquivo de log identificado: {candidate}")
-                    return True
+                    found_types.add(suffix)
+            return (len(found_types) > 0, found_types)
         except PermissionError:
             print(f"  [debug][_walk_program] Sem permissão para inspecionar logs em: {folder}")
-        return False
+        return (False, set())
 
     def _infer_date_from_name(self, name: str) -> datetime | None:
         date_match = re.search(r"(\d{8})", name)

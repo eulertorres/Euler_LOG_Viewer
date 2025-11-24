@@ -156,8 +156,8 @@ class LogDownloadDialog(QDialog):
         self.program_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.program_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.program_list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.program_list.setGridSize(QSize(180, 180))
-        self.program_list.setIconSize(QSize(120, 120))
+        self.program_list.setGridSize(QSize(210, 210))
+        self.program_list.setIconSize(QSize(140, 140))
         self.program_list.itemSelectionChanged.connect(self._on_program_selected)
 
         for program in self.programs:
@@ -430,6 +430,14 @@ class LogDownloadDialog(QDialog):
                     continue
             item = QListWidgetItem(flight.human_label())
             item.setData(Qt.ItemDataRole.UserRole, flight)
+            tooltip_lines = [
+                f"Nome: {flight.name}",
+                f"Serial/agenda: {flight.serial_folder or 'não identificado'}",
+                f"Data: {flight.date.strftime('%d/%m/%Y') if flight.date else 'desconhecida'}",
+                f"Tipos de log: {', '.join(flight.log_types) if flight.log_types else 'nenhum detectado'}",
+                f"Caminho relativo: {flight.relative_path}",
+            ]
+            item.setToolTip("\n".join(tooltip_lines))
             self.flight_list.addItem(item)
 
         self.status_label.setText(f"Mostrando {self.flight_list.count()} voos dentro do filtro.")
