@@ -8,6 +8,7 @@ import io
 import time
 import shutil
 import json
+import math
 from string import Template
 from datetime import datetime
 
@@ -283,8 +284,10 @@ class TelemetryApp(QMainWindow):
         timeline_layout = QHBoxLayout() # Cria o layout horizontal para a timeline
         self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
         self.timeline_slider.setEnabled(False)
-        self.timeline_slider.valueChanged.connect(self.update_views_from_timeline) 
-        self.timeline_slider.sliderReleased.connect(self.update_plot_cursors_on_release) 
+        self.timeline_slider.setTracking(True)
+        self.timeline_slider.valueChanged.connect(self.update_views_from_timeline)
+        self.timeline_slider.sliderMoved.connect(self.update_views_from_timeline)
+        self.timeline_slider.sliderReleased.connect(self.update_plot_cursors_on_release)
 
         self.timestamp_label = QLabel("Timestamp: --:--:--.---"); self.timestamp_label.setFixedWidth(180)
         self.btn_set_timestamp = QPushButton("Definir 🕒")
@@ -1004,11 +1007,11 @@ class TelemetryApp(QMainWindow):
         if self.df.empty or index >= len(self.df): return
         data_row = self.df.iloc[index]
         timestamp = data_row['Timestamp']
-        
+
         self.timestamp_label.setText(f"Timestamp: {timestamp.strftime('%H:%M:%S.%f')[:-3]}")
-        
+
         if 'Latitude' in data_row and 'Longitude' in data_row:
-            yaw = data_row.get('Yaw', 0)            # Pega Yaw, default 0
+            yaw = self._extract_heading_deg(data_row)
             pitch = data_row.get('Pitch', 0)
             roll = data_row.get('Roll', 0)
             lat = data_row.get('Latitude')          # Pega a lat
@@ -1100,6 +1103,22 @@ class TelemetryApp(QMainWindow):
         if self.altitude_reference is None:
             self.altitude_reference = float(alt_abs)
         return max(0.0, float(alt_abs) - float(self.altitude_reference))
+
+    def _extract_heading_deg(self, row):
+        yaw_candidates = [
+            ('Yaw', False),
+            ('AHRS_yaw', True),
+            ('EKF_yaw', True),
+            ('DCM_yaw', True)
+        ]
+        for col, is_radians in yaw_candidates:
+            if col in row and pd.notna(row[col]):
+                value = float(row[col])
+                if is_radians:
+                    value = math.degrees(value)
+                normalized = ((value + 180.0) % 360.0) - 180.0
+                return normalized
+        return 0.0
 
     def _update_altitude_reference(self):
         if self.df.empty or 'AltitudeAbs' not in self.df.columns:
