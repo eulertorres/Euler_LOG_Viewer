@@ -1097,8 +1097,6 @@ class TelemetryApp(QMainWindow):
                 const sampleTimes = Array.isArray(samples)
                     ? samples.map(s => (s && Number.isFinite(s.timeMs)) ? s.timeMs : null)
                     : [];
-                window.__timelineWindow = null;
-                let lastTimelineWindow = null;
                 const viewer = new Cesium.Viewer('timelineContainer', {
                     animation: false,
                     timeline: true,
@@ -1117,19 +1115,6 @@ class TelemetryApp(QMainWindow):
                 viewer.cesiumWidget.screenSpaceEventHandler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
                 function julianFromMs(ms) { return Cesium.JulianDate.fromDate(new Date(ms)); }
                 function clampIndex(idx) { return Math.max(0, Math.min(samples.length - 1, Number(idx) || 0)); }
-                function snapshotTimelineWindow(force) {
-                    if (!viewer.timeline) return;
-                    const start = viewer.timeline._startJulian || viewer.clock.startTime;
-                    const stop = viewer.timeline._endJulian || viewer.clock.stopTime;
-                    if (!start || !stop) return;
-                    const startMs = Cesium.JulianDate.toDate(start).getTime();
-                    const endMs = Cesium.JulianDate.toDate(stop).getTime();
-                    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
-                    if (force || !lastTimelineWindow || lastTimelineWindow.startMs !== startMs || lastTimelineWindow.endMs !== endMs) {
-                        lastTimelineWindow = { startMs, endMs };
-                        window.__timelineWindow = lastTimelineWindow;
-                    }
-                }
                 function findIndexForJulian(jd) {
                     if (!sampleTimes.length) return 0;
                     const currentMs = Cesium.JulianDate.toDate(jd).getTime();
@@ -1146,7 +1131,6 @@ class TelemetryApp(QMainWindow):
                         if (viewer.timeline) {
                             viewer.timeline.zoomTo(viewer.clock.startTime, viewer.clock.stopTime);
                         }
-                        snapshotTimelineWindow(true);
                         return;
                     }
                     const firstValidTime = sampleTimes.find(t => t !== null);
@@ -1162,15 +1146,7 @@ class TelemetryApp(QMainWindow):
                         if (viewer.timeline) {
                             viewer.timeline.zoomTo(start, stop);
                         }
-                        snapshotTimelineWindow(true);
                     }
-                }
-                if (viewer.timeline) {
-                    const originalZoomTo = viewer.timeline.zoomTo.bind(viewer.timeline);
-                    viewer.timeline.zoomTo = function(start, stop) {
-                        originalZoomTo(start, stop);
-                        snapshotTimelineWindow(true);
-                    };
                 }
                 let currentIndex = 0;
                 window.__currentTimelineIndex = 0;
@@ -1196,12 +1172,9 @@ class TelemetryApp(QMainWindow):
                         viewer.clock.shouldAnimate = false;
                         viewer.clock.currentTime = julianFromMs(t);
                         applyIndex(clamped);
-                        snapshotTimelineWindow(true);
                     }
                 };
                 configureClock();
-                snapshotTimelineWindow(true);
-                setInterval(() => snapshotTimelineWindow(false), 250);
                 window.__timelineReady = true;
             })();
         </script>
@@ -1411,23 +1384,16 @@ class TelemetryApp(QMainWindow):
 
         js_code = """
             (function() {
-                const idx = (typeof window.__currentTimelineIndex === 'number') ? window.__currentTimelineIndex : null;
-                const win = window.__timelineWindow;
-                const hasWin = win && Number.isFinite(win.startMs) && Number.isFinite(win.endMs);
-                return { idx: idx, window: hasWin ? { startMs: win.startMs, endMs: win.endMs } : null };
+                return (typeof window.__currentTimelineIndex === 'number') ? window.__currentTimelineIndex : null;
             })();
         """
         target_widget.page().runJavaScript(js_code, lambda v: self._apply_timeline_snapshot(v, push_to_cesium))
 
     def _apply_timeline_snapshot(self, payload, push_to_cesium=True):
         idx_value = payload
-        window = None
         if isinstance(payload, dict):
             idx_value = payload.get('idx', payload.get('index'))
-            window = payload.get('window')
         self._apply_timeline_index(idx_value, push_to_cesium=push_to_cesium)
-        if isinstance(window, dict):
-            self._apply_time_window_ms(window.get('startMs'), window.get('endMs'))
 
     def _apply_timeline_index(self, value, push_to_cesium=True):
         try:
@@ -1440,21 +1406,6 @@ class TelemetryApp(QMainWindow):
             idx = len(self.df) - 1
         if idx != self.current_timeline_index:
             self.update_views_from_timeline(idx, push_to_cesium=push_to_cesium)
-
-    def _apply_time_window_ms(self, start_ms, end_ms):
-        if start_ms is None or end_ms is None:
-            return
-        try:
-            start_ts = pd.to_datetime(start_ms, unit='ms').tz_localize(None)
-            end_ts = pd.to_datetime(end_ms, unit='ms').tz_localize(None)
-        except Exception:
-            return
-        if self.standard_plots_tab:
-            self.standard_plots_tab.set_time_window(start_ts, end_ts)
-        if self.all_plots_tab:
-            self.all_plots_tab.set_time_window(start_ts, end_ts)
-        if self.custom_plot_tab and hasattr(self.custom_plot_tab, 'set_time_window'):
-            self.custom_plot_tab.set_time_window(start_ts, end_ts)
 
     def on_cesium_follow_changed(self, state):
         enabled = Qt.CheckState(state) == Qt.CheckState.Checked

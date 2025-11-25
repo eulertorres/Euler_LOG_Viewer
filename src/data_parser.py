@@ -1021,8 +1021,10 @@ def parse_log_file(file_path):
 
     base_time = _infer_base_time_from_parent(file_path)
     time_deltas = pd.to_timedelta(df['Timestamp_str'], errors='coerce')
-    df['Timestamp'] = (base_time.normalize() + time_deltas).where(time_deltas.notna())
+    df['Timestamp'] = (base_time + time_deltas).where(time_deltas.notna())
     df = df.dropna(subset=['Timestamp']).reset_index(drop=True)
+    if not df.empty:
+        df['Timestamp_str'] = df['Timestamp'].dt.strftime('%H:%M:%S.%f').str[:-3]
     
     if "Yaw" in df.columns and not df["Yaw"].isnull().all():
         df["Yaw"] = ((df["Yaw"] + 180) % 360) - 180
