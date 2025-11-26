@@ -6,9 +6,10 @@ import sys
 import os
 import io
 import time
+import shutil
 import json
 import math
-import shutil
+from string import Template
 from datetime import datetime
 from pathlib import Path
 
@@ -16,10 +17,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QMessageBox, QSplitter, QGroupBox,
     QRadioButton, QTabWidget, QComboBox, QInputDialog,
-    QSlider, QLabel, QDialog, QProgressBar, QTextEdit,
+    QLabel, QDialog, QProgressBar, QTextEdit,
     QCheckBox, QStackedWidget
 )
-from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QIODevice, QBuffer
+from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QIODevice, QBuffer, QTimer
 from PyQt6.QtGui import QMovie
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -110,17 +111,56 @@ class TelemetryApp(QMainWindow):
         self.view_toggle_checkbox = None
         self.map_stack = None
         self.cesiumWidget = None
-        self.cesium_state = None
-        self.cesium_start_timestamp = None
-        self.cesium_assets_ready = False
-        self.cesium_dist_path = ""
-        self.cesium_current_html = ""
-        self.cesium_ready = False
+        self.cesium_html_path = ""
+        self.cesium_is_ready = False
+        self.cesium_plane_asset = os.path.join('assets', 'cesium', 'plane.glb')
+        self.cesium_controls_container = None
+        self.cesium_center_button = None
+        self.cesium_follow_checkbox = None
+        self.cesium_imagery_combo = None
+        self.timelineWidget = None
+        self.timeline_html_path = ""
+        self.timeline_is_ready = False
+        self.cesium_sync_timer = QTimer(self)
+        self.cesium_sync_timer.setInterval(120)
+        self.cesium_sync_timer.timeout.connect(self._sync_cesium_timeline_into_app)
+        self.cesium_imagery_presets = [
+            {
+                "key": "osm",
+                "label": "OpenStreetMap (padrão)",
+                "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                "credit": "© OpenStreetMap contributors",
+                "tilingScheme": "webMercator",
+                "maximumLevel": 19
+            },
+            {
+                "key": "esriWorldImagery",
+                "label": "Esri World Imagery (satélite)",
+                "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                "credit": "Esri, Maxar, GeoEye, Earthstar Geographics",
+                "tilingScheme": "webMercator",
+                "maximumLevel": 19
+            },
+            {
+                "key": "cartoDark",
+                "label": "Carto Dark Matter",
+                "url": "https://cartodb-basemaps-a.global.ssl.fastly.net/dark_all/{z}/{x}/{y}.png",
+                "credit": "© CARTO",
+                "tilingScheme": "webMercator",
+                "maximumLevel": 19
+            }
+        ]
+        self.current_cesium_imagery_key = self.cesium_imagery_presets[0]["key"] if self.cesium_imagery_presets else "osm"
+        self.altitude_reference = 0.0
+        self.current_timeline_index = 0
+        self.last_plot_cursor_update_time = 0.0
 
         self.aircraft_icon_filename = None
         self.wind_icon_filename = None
 
         self._register_static_assets()
+
+        self.copy_assets_to_server(self.cesium_plane_asset)
 
         self.setup_ui()
 
@@ -185,9 +225,9 @@ class TelemetryApp(QMainWindow):
         self.btn_save_pdf.setEnabled(False)
         top_controls_layout.addWidget(self.btn_save_pdf)
 
-        self.view_toggle_checkbox = QCheckBox("Visualização 3D (Cesium)")
+        self.view_toggle_checkbox = QCheckBox("Visualização 3D")
         self.view_toggle_checkbox.stateChanged.connect(self.on_view_toggle_changed)
-        self.view_toggle_checkbox.setEnabled(False)
+        self.view_toggle_checkbox.setEnabled(True)
         top_controls_layout.addWidget(self.view_toggle_checkbox)
 
         # Adiciona controles superiores ao layout principal
@@ -210,7 +250,7 @@ class TelemetryApp(QMainWindow):
         self.layout.addWidget(self.loading_status_widget) # Adiciona ao layout principal
         self.loading_status_widget.hide() # Começa escondido
 
-        # --- Painel Principal com Splitter ---
+        # --- Painel Principal com Splitter ----------------------------------------------------------------------------------------------
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # --- Abas (Painel Esquerdo do Splitter) ---
@@ -226,14 +266,35 @@ class TelemetryApp(QMainWindow):
         self._configure_webview(self.mapWidget)
         self.mapWidget.loadFinished.connect(self.on_map_load_finished)
         self.cesiumWidget = QWebEngineView()
-        self._configure_webview(self.cesiumWidget)
-        self.cesiumWidget.loadFinished.connect(self.on_cesium_load_finished)
+
+        self.cesiumWidget.loadFinished.connect(self.on_three_d_view_load_finished)
+
+        self.cesium_controls_container = QWidget()
+        cesium_controls_layout = QHBoxLayout(self.cesium_controls_container)
+        cesium_controls_layout.setContentsMargins(8, 4, 8, 4)
+        cesium_controls_layout.setSpacing(8)
+        cesium_controls_layout.addWidget(QLabel("Base do globo:"))
+        self.cesium_imagery_combo = QComboBox()
+        self.cesium_imagery_combo.currentIndexChanged.connect(self.on_cesium_imagery_changed)
+        cesium_controls_layout.addWidget(self.cesium_imagery_combo, 1)
+        self.cesium_follow_checkbox = QCheckBox("Segue o drone")
+        self.cesium_follow_checkbox.setChecked(True)
+        self.cesium_follow_checkbox.stateChanged.connect(self.on_cesium_follow_changed)
+        cesium_controls_layout.addWidget(self.cesium_follow_checkbox)
+        self.cesium_center_button = QPushButton("Foca no drone")
+        self.cesium_center_button.clicked.connect(self.center_cesium_camera)
+        self.cesium_center_button.setEnabled(False)
+        cesium_controls_layout.addWidget(self.cesium_center_button)
+        cesium_controls_layout.addStretch(1)
+        self.cesium_controls_container.hide()
 
         self.map_stack = QStackedWidget()
         self.map_stack.addWidget(self.mapWidget)
         self.map_stack.addWidget(self.cesiumWidget)
-        map_panel_layout.addWidget(self.map_stack)
+        map_panel_layout.addWidget(self.map_stack, 1)
+        map_panel_layout.addWidget(self.cesium_controls_container)
         self.map_stack.setCurrentWidget(self.mapWidget)
+        self.populate_cesium_imagery_combo()
 
         # Adiciona o painel do mapa ao splitter
         self.splitter.addWidget(map_panel_widget)
@@ -271,25 +332,35 @@ class TelemetryApp(QMainWindow):
         self.tabs.addTab(self.all_plots_tab, "Todos os Gráficos (Log Ativo)")
 
     def setup_timeline_controls(self, parent_layout):
-        timeline_layout = QHBoxLayout() # Cria o layout horizontal para a timeline
-        self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
-        self.timeline_slider.setEnabled(False)
-        self.timeline_slider.valueChanged.connect(self.update_views_from_timeline) 
-        self.timeline_slider.sliderReleased.connect(self.update_plot_cursors_on_release) 
+        wrapper_layout = QHBoxLayout()
+        #wrapper_layout.setContentsMargins(4, 4, 4, 4)
+        #wrapper_layout.setSpacing(10)
 
-        self.timestamp_label = QLabel("Timestamp: --:--:--.---"); self.timestamp_label.setFixedWidth(180)
+        self.timelineWidget = QWebEngineView()
+        self.timelineWidget.setFixedHeight(45)
+        self.timelineWidget.loadFinished.connect(self.on_timeline_load_finished)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+        self.timestamp_label = QLabel("Timestamp: --:--:--.---")
+        self.timestamp_label.setFixedWidth(180)
         self.btn_set_timestamp = QPushButton("Definir 🕒")
-        self.btn_set_timestamp.setToolTip("Definir timestamp manualmente"); self.btn_set_timestamp.setFixedWidth(80)
+        self.btn_set_timestamp.setToolTip("Definir timestamp manualmente")
+        self.btn_set_timestamp.setFixedWidth(80)
         self.btn_set_timestamp.clicked.connect(self.set_timestamp_manually)
         self.btn_set_timestamp.setEnabled(False)
 
-        # Adiciona os widgets ao layout da timeline
-        timeline_layout.addWidget(self.timeline_slider) # Slider ocupa a maior parte
-        timeline_layout.addWidget(self.btn_set_timestamp)
-        timeline_layout.addWidget(self.timestamp_label)
+        controls_layout.addWidget(self.btn_set_timestamp)
+        controls_layout.addWidget(self.timestamp_label)
 
-        # Adiciona o layout da timeline ao layout principal (vertical) que foi passado
-        parent_layout.addLayout(timeline_layout)
+        controls_container = QWidget()
+        controls_container.setLayout(controls_layout)
+
+        wrapper_layout.addWidget(self.timelineWidget, 1)
+        wrapper_layout.addWidget(controls_container, 0)
+        parent_layout.addLayout(wrapper_layout)
+        self.refresh_timeline_html()
 
     def open_log_directories(self):
         start_dir = str(self.last_logs_root) if self.last_logs_root else ""
@@ -471,16 +542,12 @@ class TelemetryApp(QMainWindow):
         if self.view_toggle_checkbox:
             self.view_toggle_checkbox.blockSignals(True)
             self.view_toggle_checkbox.setChecked(False)
-            self.view_toggle_checkbox.setEnabled(False)
             self.view_toggle_checkbox.blockSignals(False)
 
         if self.map_stack:
             self.map_stack.setCurrentWidget(self.mapWidget)
 
         self.cleanup_cesium_html()
-        self.cesium_state = None
-        self.cesium_ready = False
-        self.cesium_start_timestamp = None
 
         if self.standard_plots_tab: self.standard_plots_tab.load_dataframe(pd.DataFrame())
         if self.custom_plot_tab: self.custom_plot_tab.reload_data({})
@@ -493,6 +560,7 @@ class TelemetryApp(QMainWindow):
         if not log_name or log_name not in self.log_data: return
         self.current_log_name = log_name
         self.df = self.log_data[log_name]
+        self._update_altitude_reference()
 
         self.loading_widget.start_animation()
         self.loading_widget.open()
@@ -518,6 +586,7 @@ class TelemetryApp(QMainWindow):
             self.cesium_ready = False
             self.cesium_start_timestamp = None
             self.cleanup_cesium_html()
+            self._update_cesium_controls_state()
 
             cesium_state = self.build_cesium_state_from_dataframe()
             if cesium_state:
@@ -538,35 +607,25 @@ class TelemetryApp(QMainWindow):
             self.map_is_ready = True
             #print("DEBUG: Carregamento HTML do mapa finalizado. JS cuidará da inicialização.")
             # Atualiza a posição inicial assim que possível
-            self.update_views_from_timeline(self.timeline_slider.value())
+            self.update_views_from_timeline(self.current_timeline_index)
         else:
             self.map_is_ready = False
             print("ERRO: VISHII deu ruim o HTML do mapa, HEEELP aaaaaaaa")
 
-    def on_cesium_load_finished(self, ok):
-        self.cesium_ready = bool(ok)
-        if ok and not self.df.empty and self.cesium_start_timestamp is not None:
-            try:
-                current_ts = self.df['Timestamp'].iloc[self.timeline_slider.value()]
-                self.sync_cesium_time(current_ts)
-            except Exception:
-                pass
+    def on_three_d_view_load_finished(self, ok):
+        if ok:
+            self.statusBar().showMessage("Visualização 3D carregada!", 3000)
+            self._wait_for_cesium_ready()
+        else:
+            self.cesium_is_ready = False
+            self.statusBar().showMessage("Falha ao carregar visualização 3D.", 5000)
 
     def on_view_toggle_changed(self, state):
         if self.view_toggle_checkbox is None:
             return
         checked = Qt.CheckState(state) == Qt.CheckState.Checked
         if checked:
-            if not self.cesium_state:
-                cesium_state = self.build_cesium_state_from_dataframe()
-                if not cesium_state:
-                    self.view_toggle_checkbox.blockSignals(True)
-                    self.view_toggle_checkbox.setChecked(False)
-                    self.view_toggle_checkbox.blockSignals(False)
-                    QMessageBox.warning(self, "Viewer 3D", "Não foi possível preparar os dados para o viewer 3D.")
-                    return
-                self.cesium_state = cesium_state
-            if not self.show_cesium_view():
+            if not self.show_cesium_3d_view():
                 self.view_toggle_checkbox.blockSignals(True)
                 self.view_toggle_checkbox.setChecked(False)
                 self.view_toggle_checkbox.blockSignals(False)
@@ -574,6 +633,7 @@ class TelemetryApp(QMainWindow):
             self.map_stack.setCurrentWidget(self.cesiumWidget)
         else:
             self.map_stack.setCurrentWidget(self.mapWidget)
+        self._update_cesium_controls_state()
 
     def plot_map_route(self):
         if 'Latitude' not in self.df.columns or 'Longitude' not in self.df.columns:
@@ -745,246 +805,690 @@ class TelemetryApp(QMainWindow):
         self.mapWidget.load(map_url)
 
     def cleanup_cesium_html(self):
-        if self.cesium_current_html and os.path.exists(self.cesium_current_html):
+        if self.cesium_html_path and os.path.exists(self.cesium_html_path):
             try:
-                os.remove(self.cesium_current_html)
+                os.remove(self.cesium_html_path)
             except OSError:
                 pass
-        self.cesium_current_html = ""
+        self.cesium_html_path = ""
+        self.cesium_is_ready = False
+        self.cesium_sync_timer.stop()
 
-    def ensure_cesium_assets(self):
-        if self.cesium_assets_ready and os.path.isdir(self.cesium_dist_path):
-            return True
-        dist_dir = resource_path('UAVLogViewer', 'dist')
-        if not dist_dir.exists():
-            QMessageBox.warning(self, "Viewer 3D", "Build do UAVLogViewer não encontrado. Execute npm run build em UAVLogViewer.")
-            return False
-        dest_dir = os.path.join(self.map_server.get_temp_dir(), 'cesium_dist')
-        try:
-            if os.path.isdir(dest_dir):
-                shutil.rmtree(dest_dir)
-            shutil.copytree(str(dist_dir), dest_dir)
-        except Exception as exc:
-            QMessageBox.warning(self, "Viewer 3D", f"Erro ao preparar assets do Cesium: {exc}")
-            return False
-        self.cesium_dist_path = dest_dir
-        self.cesium_assets_ready = True
-        return True
+    def cleanup_timeline_html(self):
+        if self.timeline_html_path and os.path.exists(self.timeline_html_path):
+            try:
+                os.remove(self.timeline_html_path)
+            except OSError:
+                pass
+        self.timeline_html_path = ""
+        self.timeline_is_ready = False
 
-    def render_cesium_html(self, state_data):
-        if not self.ensure_cesium_assets():
-            return ""
-        index_path = os.path.join(self.cesium_dist_path, 'index.html')
-        if not os.path.exists(index_path):
-            return ""
+    def populate_cesium_imagery_combo(self):
+        if self.cesium_imagery_combo is None:
+            return
+        self.cesium_imagery_combo.blockSignals(True)
+        self.cesium_imagery_combo.clear()
+        for preset in self.cesium_imagery_presets:
+            self.cesium_imagery_combo.addItem(preset["label"], preset["key"])
+        if self.cesium_imagery_presets:
+            try:
+                index = next(
+                    idx for idx, preset in enumerate(self.cesium_imagery_presets)
+                    if preset["key"] == self.current_cesium_imagery_key
+                )
+            except StopIteration:
+                index = 0
+                self.current_cesium_imagery_key = self.cesium_imagery_presets[0]["key"]
+            self.cesium_imagery_combo.setCurrentIndex(index)
+        self.cesium_imagery_combo.blockSignals(False)
+
+    def on_cesium_imagery_changed(self, index):
+        if not self.cesium_imagery_presets or index < 0 or index >= len(self.cesium_imagery_presets):
+            return
+        selected_key = self.cesium_imagery_presets[index]["key"]
+        self.current_cesium_imagery_key = selected_key
+        self.update_cesium_imagery_layer(selected_key)
+
+    def update_cesium_imagery_layer(self, preset_key):
+        if not self.cesium_is_ready or not self.cesiumWidget:
+            return
+        js_code = (
+            "if (typeof setImageryLayer === 'function') {"
+            f"setImageryLayer('{preset_key}');"
+            "}"
+        )
+        self.cesiumWidget.page().runJavaScript(js_code)
+
+    def center_cesium_camera(self):
+        if not self.cesium_is_ready or not self.cesiumWidget:
+            return
+        js_code = (
+            "if (typeof centerCameraOnAircraft === 'function') {"
+            "centerCameraOnAircraft();"
+            "}"
+        )
+        self.cesiumWidget.page().runJavaScript(js_code)
+
+    def _update_cesium_controls_state(self):
+        if not self.cesium_controls_container:
+            return
+        show_controls = self.view_toggle_checkbox and self.view_toggle_checkbox.isChecked()
+        self.cesium_controls_container.setVisible(show_controls)
+        if self.cesium_center_button:
+            self.cesium_center_button.setEnabled(show_controls and self.cesium_is_ready)
+        if self.cesium_imagery_combo:
+            self.cesium_imagery_combo.setEnabled(show_controls)
+        if self.cesium_follow_checkbox:
+            self.cesium_follow_checkbox.setEnabled(show_controls and self.cesium_is_ready)
+            if not show_controls:
+                self.cesium_follow_checkbox.blockSignals(True)
+                self.cesium_follow_checkbox.setChecked(True)
+                self.cesium_follow_checkbox.blockSignals(False)
+
+    def create_cesium_viewer_html(self):
         try:
-            with open(index_path, 'r', encoding='utf-8') as f:
-                html = f.read()
-            payload = json.dumps(state_data)
-            injection = f"<script>window.__UAVLOGVIEWER_PRELOADED_STATE__ = {payload};</script>"
-            insert_at = html.find('<script')
-            if insert_at != -1:
-                html = html[:insert_at] + injection + '\n' + html[insert_at:]
-            else:
-                html = html + injection
+            self.copy_assets_to_server(self.cesium_plane_asset)
+            port = self.map_server.get_port()
+            plane_url = f"http://127.0.0.1:{port}/{os.path.basename(self.cesium_plane_asset)}"
+            plane_literal = json.dumps(plane_url)
+            imagery_config_literal = json.dumps(self.cesium_imagery_presets)
+            default_imagery_key = json.dumps(self.current_cesium_imagery_key)
+            samples_literal = json.dumps(self._build_cesium_samples())
+            html_template = Template("""<!DOCTYPE html>
+<html lang='pt-BR'>
+<head>
+    <meta charset='utf-8'>
+    <title>Visualização 3D - Cesium</title>
+    <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/cesium@1.121.0/Build/Cesium/Widgets/widgets.css'>
+    <style>
+        html, body, #cesiumContainer {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #01030a;
+        }
+        #hud {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            background: rgba(0, 0, 0, 0.55);
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            color: #f8f9fa;
+            font-size: 13px;
+            line-height: 1.4;
+            min-width: 160px;
+        }
+        #hud strong {
+            color: #4dabf7;
+        }
+        #cesiumContainer .cesium-viewer-timelineContainer {
+            bottom: 0;
+        }
+        #cesiumContainer .cesium-viewer-animationContainer {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <div id='cesiumContainer'></div>
+    <div id='hud'>
+        <div><strong>Lat:</strong> <span id='hud-lat'>--</span></div>
+        <div><strong>Lon:</strong> <span id='hud-lon'>--</span></div>
+        <div><strong>Alt:</strong> <span id='hud-alt'>--</span> m</div>
+        <div><strong>Pitch:</strong> <span id='hud-pitch'>--</span>°</div>
+        <div><strong>Roll:</strong> <span id='hud-roll'>--</span>°</div>
+    </div>
+    <script src='https://cdn.jsdelivr.net/npm/cesium@1.121.0/Build/Cesium/Cesium.js'></script>
+    <script>
+        (function () {
+            const terrainProvider = new Cesium.EllipsoidTerrainProvider();
+            const viewer = new Cesium.Viewer('cesiumContainer', {
+                animation: false,
+                timeline: false,
+                shouldAnimate: false,
+                terrainProvider: terrainProvider,
+                imageryProvider: undefined,
+                baseLayerPicker: false,
+                sceneModePicker: false,
+                navigationHelpButton: false,
+                geocoder: false,
+                fullscreenButton: false,
+                homeButton: false,
+                infoBox: false,
+                selectionIndicator: false
+            });
+            viewer.scene.globe.enableLighting = true;
+            viewer.clock.shouldAnimate = false;
+            const imageryConfigsArray = $IMAGERY_CONFIG_JSON;
+            const imageryConfigs = imageryConfigsArray.reduce((acc, cfg) => {
+                acc[cfg.key] = cfg;
+                return acc;
+            }, {});
+            const defaultImageryKey = $DEFAULT_IMAGERY_KEY;
+            const samples = $SAMPLES_JSON;
+            const sampleTimes = Array.isArray(samples)
+                ? samples.map(s => (s && Number.isFinite(s.timeMs)) ? s.timeMs : null)
+                : [];
+            const routePositions = Array.isArray(samples)
+                ? samples.map(s => (s && Number.isFinite(s.lat) && Number.isFinite(s.lon))
+                    ? { lat: s.lat, lon: s.lon, alt: Number.isFinite(s.alt) ? s.alt : 0.0 }
+                    : null)
+                : [];
+            let startJulian = undefined;
+            let stopJulian = undefined;
+            function buildTilingScheme(cfg) {
+                if (cfg.tilingScheme === 'geographic') {
+                    return new Cesium.GeographicTilingScheme();
+                }
+                return new Cesium.WebMercatorTilingScheme();
+            }
+            function createImageryProvider(cfg) {
+                return new Cesium.UrlTemplateImageryProvider({
+                    url: cfg.url,
+                    credit: cfg.credit || '',
+                    tilingScheme: buildTilingScheme(cfg),
+                    maximumLevel: Number.isFinite(cfg.maximumLevel) ? cfg.maximumLevel : undefined
+                });
+            }
+            function applyImageryLayer(key) {
+                const cfg = imageryConfigs[key] || imageryConfigs[defaultImageryKey];
+                if (!cfg) {
+                    return;
+                }
+                if (window.__currentBaseLayer) {
+                    viewer.imageryLayers.remove(window.__currentBaseLayer, true);
+                }
+                window.__currentBaseLayer = viewer.imageryLayers.addImageryProvider(
+                    createImageryProvider(cfg),
+                    0
+                );
+                return cfg;
+            }
+            applyImageryLayer(defaultImageryKey);
+            window.setImageryLayer = function(key) {
+                return applyImageryLayer(key);
+            };
+            const scratchHPR = new Cesium.HeadingPitchRoll();
+            const defaultPosition = Cesium.Cartesian3.fromDegrees(-47.9, -15.7, 1000.0);
+            const aircraftEntity = viewer.entities.add({
+                id: 'aircraft-model',
+                name: 'Aeronave',
+                position: defaultPosition,
+                model: {
+                    uri: $PLANE_LITERAL,
+                    minimumPixelSize: 80,
+                    maximumScale: 200,
+                    runAnimations: true
+                },
+                orientation: Cesium.Transforms.headingPitchRollQuaternion(
+                    defaultPosition,
+                    new Cesium.HeadingPitchRoll()
+                )
+            });
+            viewer.trackedEntity = aircraftEntity;
+            const hudLat = document.getElementById('hud-lat');
+            const hudLon = document.getElementById('hud-lon');
+            const hudAlt = document.getElementById('hud-alt');
+            const hudPitch = document.getElementById('hud-pitch');
+            const hudRoll = document.getElementById('hud-roll');
+            function updateHud(lat, lon, alt, pitchDeg, rollDeg) {
+                hudLat.textContent = Number.isFinite(lat) ? lat.toFixed(6) : '--';
+                hudLon.textContent = Number.isFinite(lon) ? lon.toFixed(6) : '--';
+                hudAlt.textContent = Number.isFinite(alt) ? alt.toFixed(1) : '--';
+                hudPitch.textContent = Number.isFinite(pitchDeg) ? pitchDeg.toFixed(1) : '--';
+                hudRoll.textContent = Number.isFinite(rollDeg) ? rollDeg.toFixed(1) : '--';
+            }
+            function radiansOrZero(valueDeg) {
+                return Cesium.Math.toRadians(Number.isFinite(valueDeg) ? valueDeg : 0.0);
+            }
+            const headingOffset = Cesium.Math.toRadians(-90.0);
+            function applySample(sample) {
+                if (!sample || !Number.isFinite(sample.lat) || !Number.isFinite(sample.lon)) {
+                    return;
+                }
+                const safeAlt = Number.isFinite(sample.alt) ? sample.alt : 0.0;
+                const position = Cesium.Cartesian3.fromDegrees(sample.lon, sample.lat, safeAlt);
+                aircraftEntity.position = position;
+                scratchHPR.heading = radiansOrZero(sample.heading) + headingOffset;
+                scratchHPR.pitch = radiansOrZero(sample.pitch);
+                scratchHPR.roll = radiansOrZero(sample.roll);
+                aircraftEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(position, scratchHPR);
+                updateHud(sample.lat, sample.lon, safeAlt, sample.pitch, sample.roll);
+            }
+            window.centerCameraOnAircraft = function() {
+                if (!aircraftEntity) {
+                    return;
+                }
+                if (window.__followEnabled !== false) {
+                    viewer.trackedEntity = aircraftEntity;
+                }
+                viewer.flyTo(aircraftEntity, {
+                    duration: 0.6,
+                    offset: new Cesium.HeadingPitchRange(0.0, -0.5, 150.0)
+                });
+            };
+            window.setFollowMode = function(enabled) {
+                window.__followEnabled = !!enabled;
+                viewer.trackedEntity = enabled ? aircraftEntity : undefined;
+            };
+            const completedPath = viewer.entities.add({
+                polyline: {
+                    positions: [],
+                    width: 3,
+                    material: new Cesium.PolylineGlowMaterialProperty({
+                        glowPower: 0.08,
+                        color: Cesium.Color.CYAN.withAlpha(0.85)
+                    })
+                }
+            });
+            const upcomingPath = viewer.entities.add({
+                polyline: {
+                    positions: [],
+                    width: 3,
+                    material: Cesium.Color.CYAN.withAlpha(0.18)
+                }
+            });
+            function toCartesian(pts) {
+                const arr = [];
+                for (const p of pts) {
+                    if (!p) continue;
+                    arr.push(p.lon, p.lat, p.alt);
+                }
+                return arr.length ? Cesium.Cartesian3.fromDegreesArrayHeights(arr) : [];
+            }
+            function updateRouteProgress(index) {
+                if (!Array.isArray(routePositions) || !routePositions.length) {
+                    return;
+                }
+                const clamped = Math.max(0, Math.min(routePositions.length, index + 1));
+                const done = routePositions.slice(0, clamped);
+                const nextSegment = routePositions.slice(Math.max(0, clamped - 1));
+                completedPath.polyline.positions = toCartesian(done);
+                upcomingPath.polyline.positions = toCartesian(nextSegment);
+            }
+            function julianFromMs(ms) {
+                return Cesium.JulianDate.fromDate(new Date(ms));
+            }
+            function findIndexForJulian(jd) {
+                if (!sampleTimes.length) return 0;
+                const currentMs = Cesium.JulianDate.toDate(jd).getTime();
+                for (let i = 0; i < sampleTimes.length; i++) {
+                    const t = sampleTimes[i];
+                    if (t === null) continue;
+                    const next = sampleTimes[Math.min(sampleTimes.length - 1, i + 1)];
+                    if (currentMs <= (next ?? currentMs)) {
+                        return i;
+                    }
+                }
+                return sampleTimes.length - 1;
+            }
+            function clampIndex(idx) {
+                return Math.max(0, Math.min(samples.length - 1, Number(idx) || 0));
+            }
+            let currentIndex = 0;
+            function applyIndex(idx) {
+                if (!Array.isArray(samples) || !samples.length) return;
+                const clamped = clampIndex(idx);
+                if (clamped === currentIndex && !viewer.clock.shouldAnimate) return;
+                currentIndex = clamped;
+                const sample = samples[clamped];
+                if (sample) {
+                    applySample(sample);
+                    if (window.__followEnabled !== false) {
+                        viewer.trackedEntity = aircraftEntity;
+                    }
+                }
+                updateRouteProgress(clamped);
+                window.__currentTimelineIndex = clamped;
+            }
+            window.setTimelineIndex = function(index) {
+                if (!sampleTimes.length) return;
+                const clamped = clampIndex(index);
+                const t = sampleTimes[clamped];
+                if (Number.isFinite(t)) {
+                    viewer.clock.shouldAnimate = false;
+                    viewer.clock.currentTime = julianFromMs(t);
+                    applyIndex(clamped);
+                }
+            };
+            if (Array.isArray(samples) && samples.length) {
+                const firstValidTime = sampleTimes.find(t => t !== null);
+                const lastValidTime = [...sampleTimes].reverse().find(t => t !== null);
+                if (Number.isFinite(firstValidTime) && Number.isFinite(lastValidTime)) {
+                    startJulian = julianFromMs(firstValidTime);
+                    stopJulian = julianFromMs(lastValidTime);
+                    viewer.clock.startTime = startJulian.clone();
+                    viewer.clock.stopTime = stopJulian.clone();
+                    viewer.clock.currentTime = startJulian.clone();
+                    viewer.clock.clockRange = Cesium.ClockRange.CLAMPED;
+                    viewer.clock.shouldAnimate = false;
+                }
+                const initialSample = samples.find(s => !!s);
+                if (initialSample) {
+                    const startPosition = Cesium.Cartesian3.fromDegrees(initialSample.lon, initialSample.lat, initialSample.alt || 0.0);
+                    aircraftEntity.position = startPosition;
+                    aircraftEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(
+                        startPosition,
+                        new Cesium.HeadingPitchRoll()
+                    );
+                }
+                viewer.trackedEntity = aircraftEntity;
+                window.__followEnabled = true;
+                viewer.clock.onTick.addEventListener(function(clock) {
+                    if (!sampleTimes.length) return;
+                    const idx = findIndexForJulian(clock.currentTime);
+                    if (idx !== currentIndex || clock.shouldAnimate) {
+                        applyIndex(idx);
+                    }
+                });
+            } else {
+                viewer.trackedEntity = aircraftEntity;
+                window.__followEnabled = true;
+            }
+            window.__cesiumViewerReady = true;
+        })();
+    </script>
+          </body>
+          </html>
+          """)
+            html_content = html_template.substitute(
+                PLANE_LITERAL=plane_literal,
+                IMAGERY_CONFIG_JSON=imagery_config_literal,
+                DEFAULT_IMAGERY_KEY=default_imagery_key,
+                SAMPLES_JSON=samples_literal
+            )
             output_name = f"cesium_view_{int(time.time()*1000)}.html"
             output_path = os.path.join(self.map_server.get_temp_dir(), output_name)
-            with open(output_path, 'w', encoding='utf-8') as out:
-                out.write(html)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
             return output_path
         except Exception as exc:
-            QMessageBox.warning(self, "Viewer 3D", f"Erro ao gerar HTML do Cesium: {exc}")
+            QMessageBox.warning(self, "Visualização 3D", f"Não foi possível preparar o Cesium: {exc}")
             return ""
 
-    def show_cesium_view(self):
-        if not self.cesium_state:
-            return False
-        html_path = self.render_cesium_html(self.cesium_state)
+    def create_cesium_timeline_html(self):
+        try:
+            samples_literal = json.dumps(self._build_cesium_samples())
+            html_template = Template("""<!DOCTYPE html>
+    <html lang='pt-BR'>
+    <head>
+        <meta charset='utf-8'>
+        <title>Timeline - Cesium</title>
+        <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/cesium@1.121.0/Build/Cesium/Widgets/widgets.css'>
+        <style>
+            html, body, #timelineContainer {
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+                overflow: hidden;
+                background: #01030a;
+            }
+            #timelineContainer .cesium-viewer-cesiumWidgetContainer,
+            #timelineContainer .cesium-viewer-toolbar,
+            #timelineContainer .cesium-viewer-fullscreenContainer,
+            #timelineContainer .cesium-viewer-animationContainer {
+                display: none !important;
+            }
+            #timelineContainer .cesium-viewer-timelineContainer {
+                bottom: 0;
+                height: 100%;
+            }
+            #timelineContainer .cesium-viewer-bottom {
+                bottom: 0;
+            }
+        </style>
+    </head>
+    <body>
+        <div id='timelineContainer'></div>
+        <script src='https://cdn.jsdelivr.net/npm/cesium@1.121.0/Build/Cesium/Cesium.js'></script>
+        <script>
+            (function () {
+                const samples = $SAMPLES_JSON;
+                const sampleTimes = Array.isArray(samples)
+                    ? samples.map(s => (s && Number.isFinite(s.timeMs)) ? s.timeMs : null)
+                    : [];
+                const viewer = new Cesium.Viewer('timelineContainer', {
+                    animation: false,
+                    timeline: true,
+                    shouldAnimate: false,
+                    imageryProvider: false,
+                    baseLayerPicker: false,
+                    geocoder: false,
+                    sceneModePicker: false,
+                    navigationHelpButton: false,
+                    fullscreenButton: false,
+                    homeButton: false,
+                    infoBox: false,
+                    selectionIndicator: false
+                });
+                viewer.scene.canvas.style.display = 'none';
+                viewer.cesiumWidget.screenSpaceEventHandler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
+                function julianFromMs(ms) { return Cesium.JulianDate.fromDate(new Date(ms)); }
+                function clampIndex(idx) { return Math.max(0, Math.min(samples.length - 1, Number(idx) || 0)); }
+                function findIndexForJulian(jd) {
+                    if (!sampleTimes.length) return 0;
+                    const currentMs = Cesium.JulianDate.toDate(jd).getTime();
+                    for (let i = 0; i < sampleTimes.length; i++) {
+                        const t = sampleTimes[i];
+                        if (t === null) continue;
+                        const next = sampleTimes[Math.min(sampleTimes.length - 1, i + 1)];
+                        if (currentMs <= (next ?? currentMs)) { return i; }
+                    }
+                    return sampleTimes.length - 1;
+                }
+                function configureClock() {
+                    if (!sampleTimes.length) {
+                        if (viewer.timeline) {
+                            viewer.timeline.zoomTo(viewer.clock.startTime, viewer.clock.stopTime);
+                        }
+                        return;
+                    }
+                    const firstValidTime = sampleTimes.find(t => t !== null);
+                    const lastValidTime = [...sampleTimes].reverse().find(t => t !== null);
+                    if (Number.isFinite(firstValidTime) && Number.isFinite(lastValidTime)) {
+                        const start = julianFromMs(firstValidTime);
+                        const stop = julianFromMs(lastValidTime);
+                        viewer.clock.startTime = start.clone();
+                        viewer.clock.stopTime = stop.clone();
+                        viewer.clock.currentTime = start.clone();
+                        viewer.clock.clockRange = Cesium.ClockRange.CLAMPED;
+                        viewer.clock.shouldAnimate = false;
+                        if (viewer.timeline) {
+                            viewer.timeline.zoomTo(start, stop);
+                        }
+                    }
+                }
+                let currentIndex = 0;
+                window.__currentTimelineIndex = 0;
+                function applyIndex(idx) {
+                    if (!Array.isArray(samples) || !samples.length) return;
+                    const clamped = clampIndex(idx);
+                    if (clamped === currentIndex && !viewer.clock.shouldAnimate) return;
+                    currentIndex = clamped;
+                    window.__currentTimelineIndex = clamped;
+                }
+                viewer.clock.onTick.addEventListener(function(clock) {
+                    if (!sampleTimes.length) return;
+                    const idx = findIndexForJulian(clock.currentTime);
+                    if (idx !== currentIndex || clock.shouldAnimate) {
+                        applyIndex(idx);
+                    }
+                });
+                window.setTimelineIndex = function(index) {
+                    if (!sampleTimes.length) return;
+                    const clamped = clampIndex(index);
+                    const t = sampleTimes[clamped];
+                    if (Number.isFinite(t)) {
+                        viewer.clock.shouldAnimate = false;
+                        viewer.clock.currentTime = julianFromMs(t);
+                        applyIndex(clamped);
+                    }
+                };
+                configureClock();
+                window.__timelineReady = true;
+            })();
+        </script>
+    </body>
+    </html>
+    """)
+            html_content = html_template.substitute(SAMPLES_JSON=samples_literal)
+            output_name = f"cesium_timeline_{int(time.time()*1000)}.html"
+            output_path = os.path.join(self.map_server.get_temp_dir(), output_name)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            return output_path
+        except Exception as exc:
+            QMessageBox.warning(self, "Timeline", f"Não foi possível preparar a timeline: {exc}")
+            return ""
+
+    def show_cesium_3d_view(self):
+        self.cleanup_cesium_html()
+        html_path = self.create_cesium_viewer_html()
         if not html_path:
             return False
-        self.cleanup_cesium_html()
-        self.cesium_current_html = html_path
+        self.cesium_html_path = html_path
         port = self.map_server.get_port()
+        self.cesium_is_ready = False
         url = QUrl(f"http://127.0.0.1:{port}/{os.path.basename(html_path)}")
-        self.cesium_ready = False
         self.cesiumWidget.load(url)
         return True
 
-    def build_cesium_state_from_dataframe(self):
-        if self.df.empty:
-            return None
-        required_cols = {'Timestamp', 'Latitude', 'Longitude'}
-        if not required_cols.issubset(set(self.df.columns)):
-            return None
-        altitude_column = 'AltitudeAbs' if 'AltitudeAbs' in self.df.columns else 'Altitude'
-        if altitude_column not in self.df.columns:
-            return None
-
-        columns = ['Timestamp', 'Latitude', 'Longitude', altitude_column]
-        for axis in ['Roll', 'Pitch', 'Yaw']:
-            if axis in self.df.columns:
-                columns.append(axis)
-
-        df = self.df[columns].dropna(subset=['Timestamp', 'Latitude', 'Longitude', altitude_column]).copy()
-        if df.empty:
-            return None
-
-        df.sort_values('Timestamp', inplace=True)
-        self.cesium_start_timestamp = None
-        try:
-            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-        except Exception:
-            return None
-
-        start_row = df.iloc[0]
-        self.cesium_start_timestamp = start_row['Timestamp']
-        start_altitude = float(start_row[altitude_column])
-
-        trajectory = []
-        time_trajectory = {}
-        time_attitude = {}
-
-        roll_available = 'Roll' in df.columns
-        pitch_available = 'Pitch' in df.columns
-        yaw_available = 'Yaw' in df.columns
-
-        for _, row in df.iterrows():
-            timestamp = row['Timestamp']
-            lat = float(row['Latitude'])
-            lon = float(row['Longitude'])
-            alt = float(row[altitude_column])
-            delta_ms = int((timestamp - self.cesium_start_timestamp).total_seconds() * 1000)
-            altitude_rel = alt - start_altitude
-            trajectory.append([lon, lat, altitude_rel, delta_ms])
-            time_trajectory[delta_ms] = [lon, lat, altitude_rel / 1000.0, delta_ms]
-
-            if roll_available and pitch_available and yaw_available:
-                roll = row.get('Roll', None)
-                pitch = row.get('Pitch', None)
-                yaw = row.get('Yaw', None)
-                if pd.notna(roll) and pd.notna(pitch) and pd.notna(yaw):
-                    time_attitude[delta_ms] = [
-                        math.radians(float(roll)),
-                        math.radians(float(pitch)),
-                        math.radians(float(yaw))
-                    ]
-
-        if not trajectory:
-            return None
-
-        max_time = trajectory[-1][3]
-        start_time_iso = self.cesium_start_timestamp.to_pydatetime().isoformat()
-
-        state = {
-            'externalDataInjected': True,
-            'mapAvailable': True,
-            'showMap': True,
-            'mapLoading': False,
-            'trajectorySources': ['python'],
-            'trajectorySource': 'python',
-            'trajectories': {
-                'python': {
-                    'trajectory': trajectory,
-                    'timeTrajectory': time_trajectory
-                }
-            },
-            'currentTrajectory': trajectory,
-            'timeTrajectory': time_trajectory,
-            'timeAttitude': time_attitude,
-            'timeAttitudeQ': {},
-            'attitudeSources': {'eulers': ['python'], 'quaternions': []},
-            'attitudeSource': 'python',
-            'vehicle': 'plane',
-            'metadata': {'startTime': start_time_iso},
-            'flightModeChanges': [],
-            'mission': [],
-            'fences': [],
-            'processDone': True,
-            'processStatus': 'Processed!',
-            'plotOn': False,
-            'messageTypes': {},
-            'messages': {},
-            'events': [],
-            'showTrajectory': True,
-            'showClickableTrajectory': False,
-            'showWaypoints': False,
-            'heightOffset': 0.0,
-            'modelScale': 10,
-            'cameraType': 'follow',
-            'isOnline': False,
-            'timeRange': [0, max_time],
-            'currentTime': 0,
-            'namedFloats': []
-        }
-        return state
-
-    def sync_cesium_time(self, timestamp):
-        if not self.cesium_ready or self.cesium_start_timestamp is None:
+    def refresh_timeline_html(self):
+        if not self.timelineWidget:
             return
-        try:
-            ts = pd.to_datetime(timestamp)
-        except Exception:
+        self.cleanup_timeline_html()
+        html_path = self.create_cesium_timeline_html()
+        if not html_path:
             return
-        delta_ms = int((ts - self.cesium_start_timestamp).total_seconds() * 1000)
-        if delta_ms < 0:
-            delta_ms = 0
-        js_code = f"if (window.__setExternalCesiumTime__) {{ window.__setExternalCesiumTime__({delta_ms}); }}"
-        self.cesiumWidget.page().runJavaScript(js_code)
+        self.timeline_html_path = html_path
+        port = self.map_server.get_port()
+        self.timeline_is_ready = False
+        url = QUrl(f"http://127.0.0.1:{port}/{os.path.basename(html_path)}")
+        self.timelineWidget.load(url)
+
+    def on_timeline_load_finished(self, ok):
+        if ok:
+            self._wait_for_timeline_ready()
+        else:
+            self.timeline_is_ready = False
+
+    def _wait_for_timeline_ready(self, retries=20):
+        if not self.timelineWidget:
+            return
+
+        def _handle_ready(result):
+            if result:
+                self.timeline_is_ready = True
+                self.statusBar().showMessage("Timeline pronta!", 2000)
+                self.update_views_from_timeline(self.current_timeline_index, push_to_cesium=True, sync_timeline_widget=False, force_plot_update=True)
+                if not self.cesium_sync_timer.isActive():
+                    self.cesium_sync_timer.start()
+            elif retries > 0:
+                QTimer.singleShot(200, lambda: self._wait_for_timeline_ready(retries - 1))
+            else:
+                self.timeline_is_ready = False
+                self.statusBar().showMessage("Não consegui sincronizar a timeline.", 4000)
+
+        try:
+            self.timelineWidget.page().runJavaScript("Boolean(window.__timelineReady)", _handle_ready)
+        except RuntimeError:
+            self.timeline_is_ready = False
+
+    def _wait_for_cesium_ready(self, retries=20):
+        if not self.cesiumWidget:
+            return
+
+        def _handle_ready(result):
+            if result:
+                self.cesium_is_ready = True
+                self.statusBar().showMessage("Cesium pronto e timeline carregada!", 3000)
+                self.update_cesium_imagery_layer(self.current_cesium_imagery_key)
+                self._update_cesium_controls_state()
+                self.update_views_from_timeline(self.current_timeline_index)
+                self.update_cesium_index(self.current_timeline_index)
+                if self.cesium_follow_checkbox:
+                    self.cesium_follow_checkbox.blockSignals(True)
+                    self.cesium_follow_checkbox.setChecked(True)
+                    self.cesium_follow_checkbox.blockSignals(False)
+                self.cesium_sync_timer.start()
+            elif retries > 0:
+                QTimer.singleShot(200, lambda: self._wait_for_cesium_ready(retries - 1))
+            else:
+                self.statusBar().showMessage("Não consegui sincronizar o Cesium.", 5000)
+                self._update_cesium_controls_state()
+
+        try:
+            self.cesiumWidget.page().runJavaScript("Boolean(window.__cesiumViewerReady)", _handle_ready)
+        except RuntimeError:
+            self.cesium_is_ready = False
+            self._update_cesium_controls_state()
 
 
     def setup_timeline(self):
+        self.last_plot_cursor_update_time = 0.0
+        self.refresh_timeline_html()
         if not self.df.empty:
-            self.timeline_slider.setRange(0, len(self.df) - 1)
-            self.timeline_slider.setValue(0)
-            self.timeline_slider.setEnabled(True)
+            self.current_timeline_index = 0
+            if 'Timestamp' in self.df.columns and not self.df['Timestamp'].empty:
+                first_ts = self.df['Timestamp'].iloc[0]
+                if pd.notna(first_ts):
+                    self.timestamp_label.setText(f"Timestamp: {first_ts.strftime('%H:%M:%S.%f')[:-3]}")
             self.btn_set_timestamp.setEnabled(True)
             self.btn_save_pdf.setEnabled(True)
+            # Mantém a timeline do Cesium como única fonte de playback
+            if not self.cesium_html_path:
+                self.show_cesium_3d_view()
         else:
-            self.timeline_slider.setEnabled(False)
+            self.current_timeline_index = 0
             self.btn_set_timestamp.setEnabled(False)
             self.btn_save_pdf.setEnabled(False)
             self.timestamp_label.setText("Timestamp: --:--:--.---")
             
-    def update_views_from_timeline(self, index):
-        if self.df.empty or index >= len(self.df): return
+    def update_views_from_timeline(self, index, push_to_cesium=False, sync_timeline_widget=False, force_plot_update=False):
+        if self.df.empty or index >= len(self.df):
+            return
+        self.current_timeline_index = index
         data_row = self.df.iloc[index]
         timestamp = data_row['Timestamp']
-        
+
         self.timestamp_label.setText(f"Timestamp: {timestamp.strftime('%H:%M:%S.%f')[:-3]}")
-        
+
         if 'Latitude' in data_row and 'Longitude' in data_row:
-            yaw_raw = data_row.get('Yaw', 0)            # Pega Yaw, default 0
-            lat = data_row.get('Latitude')              # Pega a lat
-            lon = data_row.get('Longitude')             # Pega a long
-            win = data_row.get('WindDirection', 0)      # Pega o windD
-            wsi = data_row.get('WSI', 0)                # Pega o vento
 
-            try:
-                yaw = float(yaw_raw) if pd.notna(yaw_raw) else 0
-                # Alguns logs trazem yaw em radianos; converte para graus se for pequeno.
-                if abs(yaw) <= (2 * math.pi + 0.001):
-                    yaw = math.degrees(yaw)
-            except Exception:
-                yaw = 0
-
+            yaw = self._extract_heading_deg(data_row)
+            pitch = data_row.get('Pitch', 0)
+            roll = data_row.get('Roll', 0)
+            lat = data_row.get('Latitude')          # Pega a lat
+            lon = data_row.get('Longitude')         # Pega a long
+            alt_abs = data_row.get('AltitudeAbs', 0)    # Altitude absoluta
+            win = data_row.get('WindDirection', 0)  # Pega o windD
+            wsi = data_row.get('WSI', 0)            # Pega o vento
+            if not pd.notna(yaw): yaw = 0 # Trata NaN
+            if not pd.notna(pitch): pitch = 0
+            if not pd.notna(roll): roll = 0
+            if not pd.notna(alt_abs): alt_abs = 0
             if not pd.notna(win): win = 0 # Trata NaN
             if not pd.notna(wsi): wsi = 0 # Trata NaN
 
+            alt_rel = self._compute_relative_altitude(alt_abs)
+
             self.update_aircraft_position(lat, lon, yaw, win, wsi)
+            if push_to_cesium:
+                self.update_cesium_index(index)
+                if sync_timeline_widget:
+                    self.update_timeline_index(index)
 
-        self.sync_cesium_time(timestamp)
+        now = time.monotonic()
+        if force_plot_update or (now - self.last_plot_cursor_update_time) >= 1.0:
+            self._update_plot_cursors(timestamp)
+            self.last_plot_cursor_update_time = now
 
-
-    def update_plot_cursors_on_release(self):
-        """Chamado quando o slider é SOLTO. Atualiza os cursores dos gráficos."""
-        if self.df.empty: return
-        
-        index = self.timeline_slider.value()
-        if index >= len(self.df): return # Segurança extra
-            
-        timestamp = self.df['Timestamp'].iloc[index]
-        #print(f"DEBUG: Slider solto. Atualizando cursores dos gráficos para {timestamp}")
-
+    def _update_plot_cursors(self, timestamp):
         if self.standard_plots_tab: self.standard_plots_tab.update_cursor(timestamp)
         if self.all_plots_tab: self.all_plots_tab.update_cursor(timestamp)
         if self.custom_plot_tab: self.custom_plot_tab.update_cursor(timestamp) # Ainda tem que ser implementado
@@ -999,9 +1503,155 @@ class TelemetryApp(QMainWindow):
             js_code = f"updateMarkers({lat}, {lon}, {yaw}, {win}, {wsi});"
             self.mapWidget.page().runJavaScript(js_code)
 
+    def update_cesium_index(self, index):
+        if not self.cesium_is_ready or self.cesiumWidget is None:
+            return
+        js_code = (
+            "if (typeof setTimelineIndex === 'function') {"
+            f"setTimelineIndex({int(index)});"
+            "}"
+        )
+        self.cesiumWidget.page().runJavaScript(js_code)
+
+    def update_timeline_index(self, index):
+        if not self.timeline_is_ready or self.timelineWidget is None:
+            return
+        js_code = (
+            "if (typeof setTimelineIndex === 'function') {"
+            f"setTimelineIndex({int(index)});"
+            "}"
+        )
+        self.timelineWidget.page().runJavaScript(js_code)
+
+    def _sync_cesium_timeline_into_app(self):
+        if self.df.empty:
+            return
+
+        target_widget = None
+        push_to_cesium = True
+        if self.timeline_is_ready and self.timelineWidget is not None:
+            target_widget = self.timelineWidget
+        elif self.cesium_is_ready and self.cesiumWidget is not None:
+            target_widget = self.cesiumWidget
+            push_to_cesium = False
+
+        if not target_widget:
+            return
+
+        js_code = """
+            (function() {
+                return (typeof window.__currentTimelineIndex === 'number') ? window.__currentTimelineIndex : null;
+            })();
+        """
+        target_widget.page().runJavaScript(js_code, lambda v: self._apply_timeline_snapshot(v, push_to_cesium))
+
+    def _apply_timeline_snapshot(self, payload, push_to_cesium=True):
+        idx_value = payload
+        if isinstance(payload, dict):
+            idx_value = payload.get('idx', payload.get('index'))
+        self._apply_timeline_index(idx_value, push_to_cesium=push_to_cesium)
+
+    def _apply_timeline_index(self, value, push_to_cesium=True):
+        try:
+            idx = int(value)
+        except Exception:
+            return
+        if idx < 0:
+            idx = 0
+        if idx >= len(self.df):
+            idx = len(self.df) - 1
+        if idx != self.current_timeline_index:
+            self.update_views_from_timeline(idx, push_to_cesium=push_to_cesium)
+
+    def on_cesium_follow_changed(self, state):
+        enabled = Qt.CheckState(state) == Qt.CheckState.Checked
+        if not self.cesium_is_ready or self.cesiumWidget is None:
+            return
+        js_code = (
+            "if (typeof setFollowMode === 'function') {"
+            f"setFollowMode({str(enabled).lower()});"
+            "}"
+        )
+        self.cesiumWidget.page().runJavaScript(js_code)
+
+    def _compute_relative_altitude(self, alt_abs):
+        if not pd.notna(alt_abs):
+            return 0.0
+        if self.altitude_reference is None:
+            self.altitude_reference = float(alt_abs)
+        return max(0.0, float(alt_abs) - float(self.altitude_reference))
+
+    def _timestamp_to_epoch_ms(self, timestamp):
+        if timestamp is None:
+            return None
+        try:
+            ts = pd.to_datetime(timestamp)
+            if hasattr(ts, 'tz_convert') and ts.tzinfo is not None:
+                ts = ts.tz_convert(None)
+            elif hasattr(ts, 'tz_localize'):
+                try:
+                    ts = ts.tz_localize(None)
+                except Exception:
+                    pass
+            return int(ts.value // 1_000_000)
+        except Exception:
+            return None
+
+    def _extract_heading_deg(self, row):
+        yaw_candidates = [
+            ('Yaw', False),
+            ('Yaw_deg', False),
+            ('yaw', False),
+            ('Heading', False),
+            ('AHRS_yaw', True),
+            ('EKF_yaw', True),
+            ('DCM_yaw', True),
+            ('heading', False)
+        ]
+        for col, is_radians in yaw_candidates:
+            if col in row and pd.notna(row[col]):
+                value = float(row[col])
+                if is_radians:
+                    value = math.degrees(value)
+                normalized = ((value + 180.0) % 360.0) - 180.0
+                return normalized
+        return 0.0
+
+    def _update_altitude_reference(self):
+        if self.df.empty or 'AltitudeAbs' not in self.df.columns:
+            self.altitude_reference = 0.0
+            return
+        first_valid = self.df['AltitudeAbs'].dropna()
+        self.altitude_reference = float(first_valid.iloc[0]) if not first_valid.empty else 0.0
+
+    def _build_cesium_samples(self):
+        samples = []
+        if self.df.empty:
+            return samples
+        for _, row in self.df.iterrows():
+            lat = row.get('Latitude') if 'Latitude' in row else None
+            lon = row.get('Longitude') if 'Longitude' in row else None
+            if pd.notna(lat) and pd.notna(lon):
+                alt_abs = row.get('AltitudeAbs') if 'AltitudeAbs' in row else None
+                alt_rel = self._compute_relative_altitude(alt_abs)
+                timestamp = row.get('Timestamp') if 'Timestamp' in row else None
+                time_ms = self._timestamp_to_epoch_ms(timestamp) if pd.notna(timestamp) else None
+                samples.append({
+                    'lat': float(lat),
+                    'lon': float(lon),
+                    'alt': float(alt_rel),
+                    'heading': float(self._extract_heading_deg(row)),
+                    'pitch': float(row.get('Pitch', 0) if pd.notna(row.get('Pitch', 0)) else 0),
+                    'roll': float(row.get('Roll', 0) if pd.notna(row.get('Roll', 0)) else 0),
+                    'timeMs': time_ms
+                })
+            else:
+                samples.append(None)
+        return samples
+
     def set_timestamp_manually(self):
         if self.df.empty: return
-        current_ts_str = self.df['Timestamp'].iloc[self.timeline_slider.value()].strftime('%H:%M:%S.%f')[:-3]
+        current_ts_str = self.df['Timestamp'].iloc[self.current_timeline_index].strftime('%H:%M:%S.%f')[:-3]
         text, ok = QInputDialog.getText(self, "Definir Timestamp", "Digite (HH:MM:SS.mmm):", text=current_ts_str)
         if ok and text:
             try:
@@ -1009,14 +1659,9 @@ class TelemetryApp(QMainWindow):
                 time_part = pd.to_datetime(text, format='%H:%M:%S.%f').time()
                 target_timestamp = pd.Timestamp.combine(date_part, time_part)
                 closest_index = (self.df['Timestamp'] - target_timestamp).abs().idxmin()
-                
-                # Move o slider (isso vai disparar update_views_from_timeline para label e mapa)
-                self.timeline_slider.setValue(closest_index) 
-                
-                # ### ALTERADO ### Chama explicitamente a função de atualizar os gráficos
-                # Precisamos disso aqui porque setValue não dispara sliderReleased
-                self.update_plot_cursors_on_release() 
-                
+
+                self.update_views_from_timeline(int(closest_index), push_to_cesium=True, sync_timeline_widget=True, force_plot_update=True)
+
             except ValueError:
                 QMessageBox.warning(self, "Erro de Formato", "Use HH:MM:SS.mmm.")
 
