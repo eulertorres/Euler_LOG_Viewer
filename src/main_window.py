@@ -222,7 +222,7 @@ class TelemetryApp(QMainWindow):
         self.layout.addWidget(self.loading_status_widget) # Adiciona ao layout principal
         self.loading_status_widget.hide() # Começa escondido
 
-        # --- Painel Principal com Splitter ---
+        # --- Painel Principal com Splitter ----------------------------------------------------------------------------------------------
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # --- Abas (Painel Esquerdo do Splitter) ---
@@ -290,11 +290,11 @@ class TelemetryApp(QMainWindow):
 
     def setup_timeline_controls(self, parent_layout):
         wrapper_layout = QHBoxLayout()
-        wrapper_layout.setContentsMargins(4, 4, 4, 4)
-        wrapper_layout.setSpacing(10)
+        #wrapper_layout.setContentsMargins(4, 4, 4, 4)
+        #wrapper_layout.setSpacing(10)
 
         self.timelineWidget = QWebEngineView()
-        self.timelineWidget.setFixedHeight(120)
+        self.timelineWidget.setFixedHeight(45)
         self.timelineWidget.loadFinished.connect(self.on_timeline_load_finished)
 
         controls_layout = QHBoxLayout()
