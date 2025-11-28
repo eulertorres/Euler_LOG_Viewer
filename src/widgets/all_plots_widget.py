@@ -298,8 +298,9 @@ class AllPlotsWidget(QWidget):
             config_cols = []
             if 'primary_y' in config:
                 config_cols.extend(config['primary_y']['cols'])
-            if config.get('secondary_y'):
-                config_cols.extend(config['secondary_y'].get('cols', []))
+            sconf = config.get('secondary_y')
+            if isinstance(sconf, dict):
+                config_cols.extend(sconf.get('cols', []))
 
             plotted = self._create_plot_from_config(config, df_plot)
             if plotted:
@@ -418,10 +419,10 @@ class AllPlotsWidget(QWidget):
             for col in pconf['cols']:
                 _append_series(primary_series, col, df_plot, step_mode_flag)
 
-        if 'secondary_y' in config:
-            sconf = config['secondary_y']
+        sconf = config.get('secondary_y')
+        if isinstance(sconf, dict):
             step_mode_sec_flag = True if sconf.get('style', '') == 'steps-post' else False
-            for col in sconf['cols']:
+            for col in sconf.get('cols', []):
                 _append_series(secondary_series, col, df_plot, step_mode_sec_flag)
 
         overlays = config.get('overlays', []) if isinstance(config.get('overlays'), list) else []
@@ -541,8 +542,8 @@ class AllPlotsWidget(QWidget):
                 )
                 legend_items.append((c, col))
 
-            sconf = config['secondary_y']
-            if sconf.get('label'):
+            sconf = config.get('secondary_y') if isinstance(config.get('secondary_y'), dict) else None
+            if sconf and sconf.get('label'):
                 plot_item.getAxis('right').setLabel(sconf['label'])
 
         self._ensure_legend(plot_item, legend_items)
