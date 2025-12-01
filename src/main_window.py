@@ -124,7 +124,7 @@ class TelemetryApp(QMainWindow):
         self.timeline_html_path = ""
         self.timeline_is_ready = False
         self.cesium_sync_timer = QTimer(self)
-        self.cesium_sync_timer.setInterval(120)
+        self.cesium_sync_timer.setInterval(60)
         self.cesium_sync_timer.timeout.connect(self._sync_cesium_timeline_into_app)
         self.playback_timer = QTimer(self)
         self.playback_timer.setInterval(100)
@@ -988,22 +988,22 @@ class TelemetryApp(QMainWindow):
             self.start_cesium_playback()
 
     def start_cesium_playback(self):
-        if not self.cesium_is_ready or not self.cesiumWidget:
-            return
         if not self._timestamp_ms_cache:
             return
         speed = self._current_cesium_speed_value()
         self._playback_anchor_monotonic = time.monotonic()
         self._playback_anchor_ms = self._timestamp_ms_cache[min(self.current_timeline_index, len(self._timestamp_ms_cache) - 1)]
-        if self.cesiumWidget:
+
+        if self.cesium_is_ready and self.cesiumWidget:
+            self.cesiumWidget.page().runJavaScript("if (typeof setFollowMode === 'function') { setFollowMode(true); }")
             self.cesiumWidget.page().runJavaScript("if (typeof pauseTrajectory === 'function') { pauseTrajectory(); }")
             self.cesiumWidget.page().runJavaScript(
                 f"if (typeof setPlaybackSpeed === 'function') {{ setPlaybackSpeed({speed}); }}"
             )
-            # Inicia o play diretamente no Cesium para manter a câmera seguindo o drone
             self.cesiumWidget.page().runJavaScript(
                 "if (typeof playTrajectory === 'function') { playTrajectory(); }"
             )
+
         if self.timeline_is_ready and self.timelineWidget:
             self.timelineWidget.page().runJavaScript("if (typeof pauseTimeline === 'function') { pauseTimeline(); }")
             self.timelineWidget.page().runJavaScript(
@@ -1012,8 +1012,16 @@ class TelemetryApp(QMainWindow):
             self.timelineWidget.page().runJavaScript(
                 "if (typeof playTimeline === 'function') { playTimeline(); }"
             )
-        if not self.playback_timer.isActive():
-            self.playback_timer.start()
+
+        # Quando o Cesium/timeline está pronto, deixamos o playback ser conduzido
+        # pelo JavaScript para manter a câmera fluida; o timer Python vira apenas
+        # um fallback.
+        if not (self.cesium_is_ready or self.timeline_is_ready):
+            if not self.playback_timer.isActive():
+                self.playback_timer.start()
+        else:
+            self.playback_timer.stop()
+
         self.cesium_playing = True
         self._update_cesium_play_button()
         if not self.cesium_sync_timer.isActive():
@@ -1768,6 +1776,11 @@ class TelemetryApp(QMainWindow):
         target_widget.page().runJavaScript(js_code, lambda v: self._apply_timeline_snapshot(v, push_to_cesium))
 
     def _advance_playback(self):
+        # Quando o Cesium/timeline está pronto, o JS conduz a animação e o
+        # sincronismo ocorre via _sync_cesium_timeline_into_app; aqui atuamos
+        # apenas como fallback para cenários sem webviews.
+        if (self.cesium_is_ready or self.timeline_is_ready):
+            return
         if not self.cesium_playing or not self._timestamp_ms_cache:
             return
         if self.current_timeline_index >= len(self._timestamp_ms_cache):
