@@ -1153,6 +1153,10 @@ class TelemetryApp(QMainWindow):
             const sampleTimes = Array.isArray(samples)
                 ? samples.map(s => (s && Number.isFinite(s.timeMs)) ? s.timeMs : null)
                 : [];
+            const validTimeIndex = sampleTimes
+                .map((t, i) => (Number.isFinite(t) ? { t, i } : null))
+                .filter(Boolean);
+            const validTimes = validTimeIndex.map(v => v.t);
             const routePositions = Array.isArray(samples)
                 ? samples.map(s => (s && Number.isFinite(s.lat) && Number.isFinite(s.lon))
                     ? { lat: s.lat, lon: s.lon, alt: Number.isFinite(s.alt) ? s.alt : 0.0 }
@@ -1300,17 +1304,19 @@ class TelemetryApp(QMainWindow):
                 viewer.clock.multiplier = playbackSpeed;
             }
             function findIndexForJulian(jd) {
-                if (!sampleTimes.length) return 0;
-                const currentMs = Cesium.JulianDate.toDate(jd).getTime();
-                for (let i = 0; i < sampleTimes.length; i++) {
-                    const t = sampleTimes[i];
-                    if (t === null) continue;
-                    const next = sampleTimes[Math.min(sampleTimes.length - 1, i + 1)];
-                    if (currentMs <= (next ?? currentMs)) {
-                        return i;
+                if (!validTimes.length) return 0;
+                const target = Cesium.JulianDate.toDate(jd).getTime();
+                let lo = 0;
+                let hi = validTimes.length - 1;
+                while (lo < hi) {
+                    const mid = Math.floor((lo + hi) / 2);
+                    if (validTimes[mid] >= target) {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
                     }
                 }
-                return sampleTimes.length - 1;
+                return validTimeIndex[Math.min(lo, validTimeIndex.length - 1)].i;
             }
             function clampIndex(idx) {
                 return Math.max(0, Math.min(samples.length - 1, Number(idx) || 0));
@@ -1454,6 +1460,10 @@ class TelemetryApp(QMainWindow):
                 const sampleTimes = Array.isArray(samples)
                     ? samples.map(s => (s && Number.isFinite(s.timeMs)) ? s.timeMs : null)
                     : [];
+                const validTimeIndex = sampleTimes
+                    .map((t, i) => (Number.isFinite(t) ? { t, i } : null))
+                    .filter(Boolean);
+                const validTimes = validTimeIndex.map(v => v.t);
                 let playbackSpeed = 1.0;
                 const viewer = new Cesium.Viewer('timelineContainer', {
                     animation: false,
@@ -1474,15 +1484,19 @@ class TelemetryApp(QMainWindow):
                 function julianFromMs(ms) { return Cesium.JulianDate.fromDate(new Date(ms)); }
                 function clampIndex(idx) { return Math.max(0, Math.min(samples.length - 1, Number(idx) || 0)); }
                 function findIndexForJulian(jd) {
-                    if (!sampleTimes.length) return 0;
-                    const currentMs = Cesium.JulianDate.toDate(jd).getTime();
-                    for (let i = 0; i < sampleTimes.length; i++) {
-                        const t = sampleTimes[i];
-                        if (t === null) continue;
-                        const next = sampleTimes[Math.min(sampleTimes.length - 1, i + 1)];
-                        if (currentMs <= (next ?? currentMs)) { return i; }
+                    if (!validTimes.length) return 0;
+                    const target = Cesium.JulianDate.toDate(jd).getTime();
+                    let lo = 0;
+                    let hi = validTimes.length - 1;
+                    while (lo < hi) {
+                        const mid = Math.floor((lo + hi) / 2);
+                        if (validTimes[mid] >= target) {
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
                     }
-                    return sampleTimes.length - 1;
+                    return validTimeIndex[Math.min(lo, validTimeIndex.length - 1)].i;
                 }
                 function applyPlaybackSpeed(speed) {
                     const safe = Number.isFinite(speed) ? speed : 1.0;
@@ -1716,9 +1730,10 @@ class TelemetryApp(QMainWindow):
             self.last_plot_cursor_update_time = now
 
     def _update_plot_cursors(self, timestamp):
-        if self.standard_plots_tab: self.standard_plots_tab.update_cursor(timestamp)
-        if self.all_plots_tab: self.all_plots_tab.update_cursor(timestamp)
-        if self.custom_plot_tab: self.custom_plot_tab.update_cursor(timestamp) # Ainda tem que ser implementado
+        # Timeline-to-plot cursor sync is disabled to lighten rendering and keep the
+        # 3D visualizer smooth. Re-enable selectively if a lighter Plotly refresh
+        # path is introduced.
+        return
             
     def update_aircraft_position(self, lat, lon, yaw, win, wsi):
         #print(f"DEBUG PY: Update Pos: Lat={lat:.6f}, Lon={lon:.6f}, Yaw={yaw:.1f}, WindDir={wind_dir:.1f}, WSI={wind_speed:.1f}, Ready={self.map_is_ready}")
