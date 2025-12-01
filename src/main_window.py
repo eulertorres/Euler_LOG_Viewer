@@ -1000,10 +1000,17 @@ class TelemetryApp(QMainWindow):
             self.cesiumWidget.page().runJavaScript(
                 f"if (typeof setPlaybackSpeed === 'function') {{ setPlaybackSpeed({speed}); }}"
             )
+            # Inicia o play diretamente no Cesium para manter a câmera seguindo o drone
+            self.cesiumWidget.page().runJavaScript(
+                "if (typeof playTrajectory === 'function') { playTrajectory(); }"
+            )
         if self.timeline_is_ready and self.timelineWidget:
             self.timelineWidget.page().runJavaScript("if (typeof pauseTimeline === 'function') { pauseTimeline(); }")
             self.timelineWidget.page().runJavaScript(
                 f"if (typeof setTimelinePlaybackSpeed === 'function') {{ setTimelinePlaybackSpeed({speed}); }}"
+            )
+            self.timelineWidget.page().runJavaScript(
+                "if (typeof playTimeline === 'function') { playTimeline(); }"
             )
         if not self.playback_timer.isActive():
             self.playback_timer.start()
