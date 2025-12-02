@@ -1332,12 +1332,13 @@ class TelemetryApp(QMainWindow):
                 updateRouteProgress(clamped);
                 window.__currentTimelineIndex = clamped;
             }
-            window.setTimelineIndex = function(index) {
+            window.setTimelineIndex = function(index, opts) {
                 if (!sampleTimes.length) return;
                 const clamped = clampIndex(index);
                 const t = sampleTimes[clamped];
                 if (Number.isFinite(t)) {
-                    viewer.clock.shouldAnimate = false;
+                    const keepAnim = !!(opts && opts.keepAnimating === true);
+                    viewer.clock.shouldAnimate = keepAnim && (window.__followEnabled !== false);
                     viewer.clock.currentTime = julianFromMs(t);
                     applyIndex(clamped);
                 }
@@ -1743,9 +1744,12 @@ class TelemetryApp(QMainWindow):
     def update_cesium_index(self, index):
         if not self.cesium_is_ready or self.cesiumWidget is None:
             return
+        keep_animating = self.cesium_playing and (
+            not self.cesium_follow_checkbox or self.cesium_follow_checkbox.isChecked()
+        )
         js_code = (
             "if (typeof setTimelineIndex === 'function') {"
-            f"setTimelineIndex({int(index)});"
+            f"setTimelineIndex({int(index)}, {{ keepAnimating: {str(keep_animating).lower()} }});"
             "}"
         )
         self.cesiumWidget.page().runJavaScript(js_code)
