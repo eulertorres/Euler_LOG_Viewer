@@ -127,7 +127,7 @@ class TelemetryApp(QMainWindow):
         self.cesium_sync_timer.setInterval(60)
         self.cesium_sync_timer.timeout.connect(self._sync_cesium_timeline_into_app)
         self.playback_timer = QTimer(self)
-        self.playback_timer.setInterval(100)
+        self.playback_timer.setInterval(30)
         self.playback_timer.timeout.connect(self._advance_playback)
         self._playback_anchor_monotonic = 0.0
         self._playback_anchor_ms = 0.0
@@ -1013,14 +1013,10 @@ class TelemetryApp(QMainWindow):
                 "if (typeof playTimeline === 'function') { playTimeline(); }"
             )
 
-        # Quando o Cesium/timeline está pronto, deixamos o playback ser conduzido
-        # pelo JavaScript para manter a câmera fluida; o timer Python vira apenas
-        # um fallback.
-        if not (self.cesium_is_ready or self.timeline_is_ready):
-            if not self.playback_timer.isActive():
-                self.playback_timer.start()
-        else:
-            self.playback_timer.stop()
+        # Dirige sempre pelo timer Python para manter o slider, o mapa e a câmera
+        # em sincronia, enquanto o JS recebe o índice atualizado.
+        if not self.playback_timer.isActive():
+            self.playback_timer.start()
 
         self.cesium_playing = True
         self._update_cesium_play_button()
@@ -1028,11 +1024,10 @@ class TelemetryApp(QMainWindow):
             self.cesium_sync_timer.start()
 
     def pause_cesium_playback(self):
-        if not self.cesium_is_ready or not self.cesiumWidget:
-            return
         self.playback_timer.stop()
-        js_code = "if (typeof pauseTrajectory === 'function') { pauseTrajectory(); }"
-        self.cesiumWidget.page().runJavaScript(js_code)
+        if self.cesium_is_ready and self.cesiumWidget:
+            js_code = "if (typeof pauseTrajectory === 'function') { pauseTrajectory(); }"
+            self.cesiumWidget.page().runJavaScript(js_code)
         if self.timeline_is_ready and self.timelineWidget:
             self.timelineWidget.page().runJavaScript("if (typeof pauseTimeline === 'function') { pauseTimeline(); }")
         self.cesium_playing = False
@@ -1791,11 +1786,6 @@ class TelemetryApp(QMainWindow):
         target_widget.page().runJavaScript(js_code, lambda v: self._apply_timeline_snapshot(v, push_to_cesium))
 
     def _advance_playback(self):
-        # Quando o Cesium/timeline está pronto, o JS conduz a animação e o
-        # sincronismo ocorre via _sync_cesium_timeline_into_app; aqui atuamos
-        # apenas como fallback para cenários sem webviews.
-        if (self.cesium_is_ready or self.timeline_is_ready):
-            return
         if not self.cesium_playing or not self._timestamp_ms_cache:
             return
         if self.current_timeline_index >= len(self._timestamp_ms_cache):
@@ -1812,7 +1802,12 @@ class TelemetryApp(QMainWindow):
         if idx >= len(self._timestamp_ms_cache):
             idx = len(self._timestamp_ms_cache) - 1
         if idx != self.current_timeline_index:
-            self.update_views_from_timeline(idx, push_to_cesium=True, sync_timeline_widget=True, force_plot_update=True)
+            self.update_views_from_timeline(
+                idx,
+                push_to_cesium=True,
+                sync_timeline_widget=True,
+                force_plot_update=True,
+            )
 
     def _apply_timeline_snapshot(self, payload, push_to_cesium=True):
         idx_value = payload
