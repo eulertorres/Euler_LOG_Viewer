@@ -1,4 +1,6 @@
 # all_plots_widget.py — Tema branco + legendas completas + sync X com debounce
+from dataclasses import dataclass
+
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QScrollArea, QCheckBox, QGridLayout
 from PyQt6.QtCore import Qt, QTimer
 import pandas as pd
@@ -17,6 +19,14 @@ pg.setConfigOptions(
     background='w',   # fundo branco
     foreground='k'    # textos/linhas padrão pretos
 )
+
+
+@dataclass
+class ModeSegment:
+    start: float
+    end: float
+    label: str
+    color: tuple
 
 class DateAxisItem(pg.AxisItem):
     """Eixo X que formata timestamps (segundos desde epoch) como HH:MM:SS."""
@@ -48,6 +58,7 @@ class AllPlotsWidget(QWidget):
         self._syncing = False
         self._plot_widgets = []
         self.current_log_name = ""
+        self._mode_segments: list[ModeSegment] = []
 
         # Timer de debounce para sincronizar X
         self._sync_timer = QTimer(self)
@@ -158,6 +169,7 @@ class AllPlotsWidget(QWidget):
         self.axes_list.clear()
         self.vlines.clear()
         self._plot_widgets.clear()
+        self._mode_segments = []
 
     def _update_plots(self):
         self._clear_plots()
@@ -173,6 +185,10 @@ class AllPlotsWidget(QWidget):
         ts_epoch = self.df['Timestamp'].map(self._to_epoch_seconds)
         df_plot = self.df.copy()
         df_plot['_ts_'] = ts_epoch
+
+        self._mode_segments = self._compute_mode_segments(df_plot)
+        if self._mode_segments:
+            self._add_mode_timeline(df_plot)
 
         plotting_config = [
             {'title': 'Atitude da Aeronave', 'primary_y': {'cols': ['Roll', 'Pitch', 'Yaw'], 'label': 'Graus (°)'}},
@@ -192,7 +208,7 @@ class AllPlotsWidget(QWidget):
         ]
 
         plotted_cols = set()
-        graphs_added = False
+        graphs_added = bool(self._mode_segments)
 
         for config in plotting_config:
             config_cols = []
@@ -414,6 +430,8 @@ class AllPlotsWidget(QWidget):
         self.plots_layout.addWidget(container)
         self._plot_widgets.append(plotw)
 
+        self._add_mode_regions(plot_item)
+
         return plotted_cols
 
     def _format_plot_title(self, base_title: str) -> str:
@@ -510,6 +528,128 @@ class AllPlotsWidget(QWidget):
             line.hide()
             plotw.addItem(line)
             self.vlines.append(line)
+
+    # ---------- Faixas de modo de voo ----------
+    def _compute_mode_segments(self, df_plot: pd.DataFrame):
+        if 'ModoVoo' not in df_plot.columns or df_plot.empty:
+            return []
+
+        try:
+            mode_data = df_plot[['_ts_', 'ModoVoo']].dropna().sort_values('_ts_')
+        except Exception:
+            return []
+
+        if mode_data.empty:
+            return []
+
+        palette = self._resolve_mode_palette(df_plot)
+        segments: list[ModeSegment] = []
+
+        ts_values = mode_data['_ts_'].to_numpy(dtype=float)
+        mode_values = mode_data['ModoVoo'].to_numpy(dtype=int)
+
+        current_mode = mode_values[0]
+        start_ts = ts_values[0]
+
+        def _append_segment(seg_start, seg_end, mode_value):
+            if seg_end <= seg_start:
+                return
+            label, color = palette.get(mode_value, (f"Modo {mode_value}", (160, 160, 160)))
+            segments.append(ModeSegment(seg_start, seg_end, label, color))
+
+        for idx in range(1, len(ts_values)):
+            ts = ts_values[idx]
+            mode_val = mode_values[idx]
+            if mode_val != current_mode:
+                _append_segment(start_ts, ts, current_mode)
+                start_ts = ts
+                current_mode = mode_val
+
+        try:
+            last_ts = float(df_plot['_ts_'].max())
+        except Exception:
+            last_ts = ts_values[-1] if len(ts_values) else start_ts
+        _append_segment(start_ts, last_ts, current_mode)
+
+        return segments
+
+    def _resolve_mode_palette(self, df_plot: pd.DataFrame):
+        fw_modes = {
+            -1: ("RC Mode", (96, 125, 139)),
+            0: ("Subir (RTL)", (3, 155, 229)),
+            1: ("Manual (FW150)", (33, 150, 243)),
+            2: ("SEMI", (0, 188, 212)),
+            3: ("Survey", (76, 175, 80)),
+            4: ("Tracking", (255, 202, 40)),
+            5: ("Orbit", (255, 112, 67)),
+            8: ("Landing", (244, 67, 54)),
+            9: ("TakeOff", (141, 110, 99)),
+        }
+
+        rw_modes = {
+            0: ("Stabilize", (3, 169, 244)),
+            1: ("IDLE", (120, 144, 156)),
+            2: ("AUTO", (76, 175, 80)),
+            3: ("Forced Land", (244, 67, 54)),
+        }
+
+        is_rw = False
+        if 'isVTOL' in df_plot.columns:
+            try:
+                is_rw = bool(df_plot['isVTOL'].dropna().astype(float).mean() >= 0.5)
+            except Exception:
+                is_rw = False
+
+        return rw_modes if is_rw else fw_modes
+
+    def _add_mode_timeline(self, df_plot: pd.DataFrame):
+        if not self._mode_segments:
+            return
+
+        timeline = pg.PlotWidget(axisItems={'bottom': DateAxisItem(orientation='bottom')})
+        timeline.setMinimumHeight(120)
+        timeline.setTitle(self._format_plot_title("Timeline de Modos de Voo"))
+        timeline.hideAxis('left')
+        timeline.getPlotItem().showGrid(x=True, y=False, alpha=0.15)
+
+        plot_item = timeline.getPlotItem()
+        plot_item.setYRange(0, 1, padding=0)
+        plot_item.setMouseEnabled(x=True, y=False)
+
+        try:
+            plot_item.setXRange(float(df_plot['_ts_'].min()), float(df_plot['_ts_'].max()), padding=0)
+        except Exception:
+            pass
+
+        bars = []
+        for seg in self._mode_segments:
+            width = max(seg.end - seg.start, 0)
+            if width <= 0:
+                continue
+            bars.append(pg.BarGraphItem(x=[seg.start + width / 2], height=[1], width=[width],
+                                        brushes=[pg.mkBrush(*seg.color, 140)], pens=[pg.mkPen(None)]))
+        for bar in bars:
+            plot_item.addItem(bar)
+
+        for seg in self._mode_segments:
+            center = seg.start + (seg.end - seg.start) / 2
+            txt = pg.TextItem(seg.label, anchor=(0.5, 0.5), color=(50, 50, 50))
+            txt.setPos(center, 0.5)
+            txt.setZValue(1)
+            plot_item.addItem(txt)
+
+        self.axes_list.append(plot_item.vb)
+        self._plot_widgets.append(timeline)
+        self.plots_layout.addWidget(timeline)
+
+    def _add_mode_regions(self, plot_item: pg.PlotItem):
+        if not self._mode_segments:
+            return
+
+        for seg in self._mode_segments:
+            region = pg.LinearRegionItem(values=(seg.start, seg.end), brush=pg.mkBrush(*seg.color, 45), movable=False)
+            region.setZValue(-10)
+            plot_item.addItem(region)
 
     # ---------- Utilidades ----------
     @staticmethod
