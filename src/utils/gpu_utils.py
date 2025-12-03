@@ -86,9 +86,14 @@ def apply_best_gpu_env(preferred_index: int | None = None) -> Optional[GpuInfo]:
 
     # Ativa aceleração no WebEngine quando possível.
     chromium_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-    accel_flags = "--ignore-gpu-blocklist --enable-gpu-rasterization --use-gl=desktop"
-    if accel_flags not in chromium_flags:
-        merged = (chromium_flags + " " + accel_flags).strip()
-        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = merged
+    # Evita forçar um backend GL específico; algumas máquinas retornam
+    # erro com `--use-gl=desktop`. Mantemos apenas sinalizadores seguros
+    # e acumulamos sem duplicar.
+    accel_flags = ["--ignore-gpu-blocklist", "--enable-gpu-rasterization"]
+    merged_flags = chromium_flags.split()
+    for flag in accel_flags:
+        if flag not in merged_flags:
+            merged_flags.append(flag)
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(f for f in merged_flags if f)
 
     return chosen
