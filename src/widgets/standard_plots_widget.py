@@ -67,6 +67,11 @@ class StandardPlotsWidget(QWidget):
         if not self.radio_rpy.isChecked():
             self.radio_rpy.setChecked(True)
 
+    # Compatibilidade com chamadas antigas: manter o mesmo comportamento
+    # padrão (RPY) quando a janela principal ainda invoca show_position_plot.
+    def show_position_plot(self):
+        self.show_rpy_plot()
+
     def update_cursor(self, timestamp):
         """Atualiza a linha vertical (cursor) no gráfico."""
         if self.df.empty or not self.vlines:
