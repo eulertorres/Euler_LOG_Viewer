@@ -1307,22 +1307,8 @@ class TelemetryApp(QMainWindow):
             return ""
 
     def create_cesium_timeline_html(self):
-        def _write_html(content: str) -> str:
-            output_name = f"cesium_timeline_{int(time.time()*1000)}.html"
-            output_path = os.path.join(self.map_server.get_temp_dir(), output_name)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            return output_path
-
         try:
-            try:
-                samples = self._build_cesium_samples()
-            except Exception as exc:
-                print(f"[timeline] amostragem padrão usada por erro: {exc}")
-                samples = []
-
-            samples_literal = json.dumps(samples or [])
-
+            samples_literal = json.dumps(self._build_cesium_samples())
             html_template = Template("""<!DOCTYPE html>
     <html lang='pt-BR'>
     <head>
@@ -1330,7 +1316,7 @@ class TelemetryApp(QMainWindow):
         <title>Timeline - Cesium</title>
         <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/cesium@1.121.0/Build/Cesium/Widgets/widgets.css'>
         <style>
-            html, body {
+            html, body, #timelineContainer {
                 width: 100%;
                 height: 100%;
                 margin: 0;
@@ -1338,11 +1324,6 @@ class TelemetryApp(QMainWindow):
                 overflow: hidden;
                 background: #01030a;
             }
-            #timelineContainer, #fallbackContainer {
-                width: 100%;
-                height: 100%;
-            }
-            #timelineContainer { position: relative; }
             #timelineContainer .cesium-viewer-cesiumWidgetContainer,
             #timelineContainer .cesium-viewer-toolbar,
             #timelineContainer .cesium-viewer-fullscreenContainer,
@@ -1353,175 +1334,113 @@ class TelemetryApp(QMainWindow):
                 bottom: 0;
                 height: 100%;
             }
-            #timelineContainer .cesium-viewer-bottom { bottom: 0; }
-            #fallbackContainer {
-                display: none;
-                align-items: center;
-                gap: 8px;
-                padding: 6px;
-                box-sizing: border-box;
-                background: #000;
-                color: #fff;
-                font-family: Arial, sans-serif;
+            #timelineContainer .cesium-viewer-bottom {
+                bottom: 0;
             }
-            #fallbackSlider { flex: 1; }
-            #fallbackLabel { min-width: 70px; text-align: right; font-size: 12px; }
         </style>
     </head>
     <body>
         <div id='timelineContainer'></div>
-        <div id='fallbackContainer'>
-            <input type='range' id='fallbackSlider' min='0' max='0' value='0' step='1' />
-            <span id='fallbackLabel'>0 / 0</span>
-        </div>
         <script src='https://cdn.jsdelivr.net/npm/cesium@1.121.0/Build/Cesium/Cesium.js'></script>
         <script>
             (function () {
-                let viewer = null;
                 const samples = $SAMPLES_JSON;
                 const sampleTimes = Array.isArray(samples)
                     ? samples.map(s => (s && Number.isFinite(s.timeMs)) ? s.timeMs : null)
                     : [];
-                const fallbackEl = document.getElementById('fallbackContainer');
-                const fallbackSlider = document.getElementById('fallbackSlider');
-                const fallbackLabel = document.getElementById('fallbackLabel');
-
-                function applyFallback(idx) {
-                    const maxIdx = Math.max(sampleTimes.length - 1, 0);
-                    const clamped = Math.max(0, Math.min(maxIdx, Number(idx) || 0));
-                    window.__currentTimelineIndex = clamped;
-                    fallbackSlider.value = clamped;
-                    const total = Math.max(1, maxIdx + 1);
-                    fallbackLabel.textContent = `${clamped + 1} / ${total}`;
+                const viewer = new Cesium.Viewer('timelineContainer', {
+                    animation: false,
+                    timeline: true,
+                    shouldAnimate: false,
+                    imageryProvider: false,
+                    baseLayerPicker: false,
+                    geocoder: false,
+                    sceneModePicker: false,
+                    navigationHelpButton: false,
+                    fullscreenButton: false,
+                    homeButton: false,
+                    infoBox: false,
+                    selectionIndicator: false
+                });
+                viewer.scene.canvas.style.display = 'none';
+                viewer.cesiumWidget.screenSpaceEventHandler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
+                function julianFromMs(ms) { return Cesium.JulianDate.fromDate(new Date(ms)); }
+                function clampIndex(idx) { return Math.max(0, Math.min(samples.length - 1, Number(idx) || 0)); }
+                function findIndexForJulian(jd) {
+                    if (!sampleTimes.length) return 0;
+                    const currentMs = Cesium.JulianDate.toDate(jd).getTime();
+                    for (let i = 0; i < sampleTimes.length; i++) {
+                        const t = sampleTimes[i];
+                        if (t === null) continue;
+                        const next = sampleTimes[Math.min(sampleTimes.length - 1, i + 1)];
+                        if (currentMs <= (next ?? currentMs)) { return i; }
+                    }
+                    return sampleTimes.length - 1;
                 }
-
-                function enableFallback() {
-                    document.getElementById('timelineContainer').style.display = 'none';
-                    fallbackEl.style.display = 'flex';
-                    const maxIdx = Math.max(sampleTimes.length - 1, 0);
-                    fallbackSlider.max = maxIdx;
-                    fallbackSlider.disabled = maxIdx === 0;
-                    fallbackSlider.oninput = () => applyFallback(fallbackSlider.value);
-                    window.setTimelineIndex = (index) => applyFallback(index);
-                    window.__timelineReady = true;
-                    applyFallback(0);
-                }
-
-                try {
-                    window.__currentTimelineIndex = 0;
-                    window.__timelineReady = false;
-                    viewer = new Cesium.Viewer('timelineContainer', {
-                        animation: false,
-                        timeline: true,
-                        shouldAnimate: false,
-                        imageryProvider: false,
-                        baseLayerPicker: false,
-                        geocoder: false,
-                        sceneModePicker: false,
-                        navigationHelpButton: false,
-                        fullscreenButton: false,
-                        homeButton: false,
-                        infoBox: false,
-                        selectionIndicator: false
-                    });
-                    viewer.scene.canvas.style.display = 'none';
-                    viewer.cesiumWidget.screenSpaceEventHandler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
-
+                function configureClock() {
                     if (!sampleTimes.length) {
-                        enableFallback();
-                        if (viewer && !viewer.isDestroyed()) { viewer.destroy(); }
+                        if (viewer.timeline) {
+                            viewer.timeline.zoomTo(viewer.clock.startTime, viewer.clock.stopTime);
+                        }
                         return;
                     }
-
-                    function julianFromMs(ms) { return Cesium.JulianDate.fromDate(new Date(ms)); }
-                    function clampIndex(idx) { return Math.max(0, Math.min(samples.length - 1, Number(idx) || 0)); }
-                    function findIndexForJulian(jd) {
-                        const currentMs = Cesium.JulianDate.toDate(jd).getTime();
-                        for (let i = 0; i < sampleTimes.length; i++) {
-                            const t = sampleTimes[i];
-                            if (t === null) continue;
-                            const next = sampleTimes[Math.min(sampleTimes.length - 1, i + 1)];
-                            if (currentMs <= (next ?? currentMs)) { return i; }
+                    const firstValidTime = sampleTimes.find(t => t !== null);
+                    const lastValidTime = [...sampleTimes].reverse().find(t => t !== null);
+                    if (Number.isFinite(firstValidTime) && Number.isFinite(lastValidTime)) {
+                        const start = julianFromMs(firstValidTime);
+                        const stop = julianFromMs(lastValidTime);
+                        viewer.clock.startTime = start.clone();
+                        viewer.clock.stopTime = stop.clone();
+                        viewer.clock.currentTime = start.clone();
+                        viewer.clock.clockRange = Cesium.ClockRange.CLAMPED;
+                        viewer.clock.shouldAnimate = false;
+                        if (viewer.timeline) {
+                            viewer.timeline.zoomTo(start, stop);
                         }
-                        return sampleTimes.length - 1;
-                    }
-
-                    function configureClock() {
-                        const firstValidTime = sampleTimes.find(t => t !== null);
-                        const lastValidTime = [...sampleTimes].reverse().find(t => t !== null);
-                        if (Number.isFinite(firstValidTime) && Number.isFinite(lastValidTime)) {
-                            const start = julianFromMs(firstValidTime);
-                            const stop = julianFromMs(lastValidTime);
-                            viewer.clock.startTime = start.clone();
-                            viewer.clock.stopTime = stop.clone();
-                            viewer.clock.currentTime = start.clone();
-                            viewer.clock.clockRange = Cesium.ClockRange.CLAMPED;
-                            viewer.clock.shouldAnimate = false;
-                            if (viewer.timeline) {
-                                viewer.timeline.zoomTo(start, stop);
-                            }
-                        }
-                    }
-
-                    let currentIndex = 0;
-                    window.__currentTimelineIndex = 0;
-
-                    function applyIndex(idx) {
-                        const clamped = clampIndex(idx);
-                        if (clamped === currentIndex && !viewer.clock.shouldAnimate) return;
-                        currentIndex = clamped;
-                        window.__currentTimelineIndex = clamped;
-                    }
-
-                    viewer.clock.onTick.addEventListener(function(clock) {
-                        const idx = findIndexForJulian(clock.currentTime);
-                        if (idx !== currentIndex || clock.shouldAnimate) {
-                            applyIndex(idx);
-                        }
-                    });
-
-                    window.setTimelineIndex = function(index) {
-                        const clamped = clampIndex(index);
-                        const t = sampleTimes[clamped];
-                        if (Number.isFinite(t)) {
-                            viewer.clock.shouldAnimate = false;
-                            viewer.clock.currentTime = julianFromMs(t);
-                            applyIndex(clamped);
-                        }
-                    };
-
-                    configureClock();
-                    window.__timelineReady = true;
-                } catch (err) {
-                    console.error('Timeline fallback', err);
-                    enableFallback();
-                } finally {
-                    if (viewer && viewer.timeline && !viewer.isDestroyed()) {
-                        try { viewer.timeline.resize(); } catch (e) {}
-                    }
-                    if (!window.__timelineReady) {
-                        window.__timelineReady = true;
                     }
                 }
+                let currentIndex = 0;
+                window.__currentTimelineIndex = 0;
+                function applyIndex(idx) {
+                    if (!Array.isArray(samples) || !samples.length) return;
+                    const clamped = clampIndex(idx);
+                    if (clamped === currentIndex && !viewer.clock.shouldAnimate) return;
+                    currentIndex = clamped;
+                    window.__currentTimelineIndex = clamped;
+                }
+                viewer.clock.onTick.addEventListener(function(clock) {
+                    if (!sampleTimes.length) return;
+                    const idx = findIndexForJulian(clock.currentTime);
+                    if (idx !== currentIndex || clock.shouldAnimate) {
+                        applyIndex(idx);
+                    }
+                });
+                window.setTimelineIndex = function(index) {
+                    if (!sampleTimes.length) return;
+                    const clamped = clampIndex(index);
+                    const t = sampleTimes[clamped];
+                    if (Number.isFinite(t)) {
+                        viewer.clock.shouldAnimate = false;
+                        viewer.clock.currentTime = julianFromMs(t);
+                        applyIndex(clamped);
+                    }
+                };
+                configureClock();
+                window.__timelineReady = true;
             })();
         </script>
     </body>
     </html>
     """)
-            html_content = html_template.substitute(
-                SAMPLES_JSON=samples_literal
-            )
-            return _write_html(html_content)
+            html_content = html_template.substitute(SAMPLES_JSON=samples_literal)
+            output_name = f"cesium_timeline_{int(time.time()*1000)}.html"
+            output_path = os.path.join(self.map_server.get_temp_dir(), output_name)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            return output_path
         except Exception as exc:
-            try:
-                self.statusBar().showMessage("Timeline simples carregada (fallback).", 4000)
-                fallback = """<!DOCTYPE html>
-    <html><head><meta charset='utf-8'><style>html,body,#t{margin:0;padding:0;width:100%;height:100%;background:#000;}</style></head>
-    <body><div id='t'></div><script>window.__timelineReady=true;window.__currentTimelineIndex=0;</script></body></html>
-    """
-                return _write_html(fallback)
-            except Exception:
-                return ""
+            QMessageBox.warning(self, "Timeline", f"Não foi possível preparar a timeline: {exc}")
+            return ""
 
     def show_cesium_3d_view(self):
         self.cleanup_cesium_html()
