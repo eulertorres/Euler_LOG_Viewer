@@ -91,9 +91,11 @@ class TelemetryApp(QMainWindow):
         self.original_window_title = "SUPER VISUALIZADOR DE LOG DO EULER!! (～￣▽￣)～ - v0.2.3"
         self.setWindowTitle(self.original_window_title) 
         self.setGeometry(100, 100, 1600, 900)
-        
+
         self.log_data = {}
         self.current_log_name = ""
+        self.current_log_type = ""
+        self.log_types: dict[str, str] = {}
         self.df = pd.DataFrame()
         self.thread = None
         self.worker = None
@@ -341,14 +343,14 @@ class TelemetryApp(QMainWindow):
         )
 
     def setup_tabs(self):
+        self.all_plots_tab = AllPlotsWidget(self)
+        self.tabs.addTab(self.all_plots_tab, "Todos os Gráficos (Log Ativo)")
+
         self.standard_plots_tab = StandardPlotsWidget(self) # Cria o novo widget
-        self.tabs.addTab(self.standard_plots_tab, "Gráficos Padrão")
+        self.tabs.addTab(self.standard_plots_tab, "Análise de dados")
 
         self.custom_plot_tab = CustomPlotWidget(self)
         self.tabs.addTab(self.custom_plot_tab, "Gráfico de Comparação")
-
-        self.all_plots_tab = AllPlotsWidget(self)
-        self.tabs.addTab(self.all_plots_tab, "Todos os Gráficos (Log Ativo)")
 
     def setup_timeline_controls(self, parent_layout):
         wrapper_layout = QHBoxLayout()
@@ -394,20 +396,7 @@ class TelemetryApp(QMainWindow):
         self._start_loading_from_path(root_path)
 
     def open_options_dialog(self):
-        graphs_titles = []
-        graph_states = {}
-        apply_graphs_cb = None
-        if hasattr(self, 'all_plots_tab') and self.all_plots_tab:
-            graphs_titles = self.all_plots_tab.get_available_graph_titles()
-            graph_states = self.all_plots_tab.get_graph_states()
-            apply_graphs_cb = self.all_plots_tab.apply_graph_visibility
-
-        dialog = OptionsDialog(
-            self,
-            graph_titles=graphs_titles,
-            graph_states=graph_states,
-            apply_graphs_callback=apply_graphs_cb,
-        )
+        dialog = OptionsDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.app_config = load_config()
             self.cesium_sync_timer.setInterval(self._current_sync_interval())
@@ -510,6 +499,7 @@ class TelemetryApp(QMainWindow):
         message = f"INFO: Log '{log_name}' carregado (Tipo: {log_type})"
         self.status_log_output.append(message)
         print(message) # Mantém no console também, se desejar
+        self.log_types[log_name] = log_type
 
     def on_loading_progress(self, value):
         """Atualiza a barra de progresso."""
@@ -569,8 +559,10 @@ class TelemetryApp(QMainWindow):
     def _clear_all_data(self):
         self.map_is_ready = False
         self.log_data.clear()
+        self.log_types.clear()
         self.df = pd.DataFrame()
         self.current_log_name = ""
+        self.current_log_type = ""
         self.log_selector_combo.blockSignals(True)
         self.log_selector_combo.clear()
         self.log_selector_combo.blockSignals(False)
@@ -589,7 +581,7 @@ class TelemetryApp(QMainWindow):
 
         if self.standard_plots_tab: self.standard_plots_tab.load_dataframe(pd.DataFrame())
         if self.custom_plot_tab: self.custom_plot_tab.reload_data({})
-        if self.all_plots_tab: self.all_plots_tab.load_dataframe(pd.DataFrame(), "")
+        if self.all_plots_tab: self.all_plots_tab.load_dataframe(pd.DataFrame(), "", "")
 
         self.mapWidget.setHtml("")
         self.setup_timeline()
@@ -598,6 +590,9 @@ class TelemetryApp(QMainWindow):
         if not log_name or log_name not in self.log_data: return
         self.current_log_name = log_name
         self.df = self.log_data[log_name]
+        self.current_log_type = self.log_types.get(log_name, "")
+        if hasattr(self.df, 'attrs'):
+            self.current_log_type = self.current_log_type or self.df.attrs.get('log_type', "")
         self._update_altitude_reference()
 
         self.loading_widget.start_animation()
@@ -606,12 +601,11 @@ class TelemetryApp(QMainWindow):
 
         try:
             if self.standard_plots_tab: self.standard_plots_tab.load_dataframe(self.df, self.current_log_name)
-            if self.all_plots_tab: self.all_plots_tab.load_dataframe(self.df, self.current_log_name)
+            if self.all_plots_tab: self.all_plots_tab.load_dataframe(self.df, self.current_log_name, self.current_log_type)
             # O custom_plot_tab já recebe todos os logs no on_loading_finished
 
-            if self.tabs and self.standard_plots_tab:
-                self.tabs.setCurrentWidget(self.standard_plots_tab)
-                self.standard_plots_tab.show_position_plot()
+            if self.tabs and self.all_plots_tab:
+                self.tabs.setCurrentWidget(self.all_plots_tab)
 
             self.plot_map_route() # Recria o mapa
             self.setup_timeline()
@@ -702,6 +696,9 @@ class TelemetryApp(QMainWindow):
             self.map_stack.setCurrentWidget(self.mapWidget)
         self._update_cesium_controls_state()
 
+    def _should_render_mode_colors(self) -> bool:
+        return 'xcockpit' not in (self.current_log_type or '').lower()
+
     def plot_map_route(self):
         if 'Latitude' not in self.df.columns or 'Longitude' not in self.df.columns:
             self.mapWidget.setHtml("<html><body><h1>Mas num tem dado GPS meu filho!!.</h1></body></html>"); return
@@ -714,8 +711,9 @@ class TelemetryApp(QMainWindow):
         m = folium.Map(location=map_center, zoom_start=15)
         self.map_js_name = m.get_name() # Guarda o nome JS do mapa principal
 
-        mode_segments = compute_mode_segments(self.df)
-        mode_paths = build_mode_path_segments(self.df, mode_segments)
+        should_render_modes = self._should_render_mode_colors()
+        mode_segments = compute_mode_segments(self.df) if should_render_modes else []
+        mode_paths = build_mode_path_segments(self.df, mode_segments) if should_render_modes else []
         if mode_paths:
             for seg in mode_paths:
                 seg_coords = [(lat, lon) for lat, lon, _ in seg['points']]
@@ -727,6 +725,8 @@ class TelemetryApp(QMainWindow):
             folium.PolyLine(coords, color="blue", weight=3, opacity=0.8).add_to(m)
         folium.Marker(location=coords[0], popup="Início", icon=folium.Icon(color="green")).add_to(m)
         folium.Marker(location=coords[-1], popup="Fim", icon=folium.Icon(color="red")).add_to(m)
+        if mode_segments:
+            self._add_mode_legend_to_map(m, mode_segments)
 
         # --- Ícone do aviaum  ---
         temp_dir = Path(self.map_server.get_temp_dir())
@@ -879,6 +879,74 @@ class TelemetryApp(QMainWindow):
         map_url = QUrl.fromLocalFile(self.temp_map_file_path)
         self.map_is_ready = False
         self.mapWidget.load(map_url)
+
+    def _add_mode_legend_to_map(self, m: folium.Map, segments):
+        seen = set()
+        unique_segments = []
+        for seg in segments:
+            if seg.mode_value in seen:
+                continue
+            seen.add(seg.mode_value)
+            unique_segments.append(seg)
+
+        if not unique_segments:
+            return
+
+        items_html = "".join([
+            f"<div class='mode-item'><span class='mode-swatch' style='background:{self._rgb_to_hex(seg.color)}'></span><span class='mode-label'>{seg.label}</span></div>"
+            for seg in unique_segments
+        ])
+
+        legend_html = f"""
+        <style>
+            .mode-legend {{
+                background: rgba(255,255,255,0.92);
+                border: 1px solid #b0bec5;
+                border-radius: 6px;
+                padding: 8px 10px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+                font-size: 12px;
+                color: #263238;
+            }}
+            .mode-legend-title {{
+                font-weight: 700;
+                margin-bottom: 6px;
+            }}
+            .mode-item {{
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin-bottom: 4px;
+            }}
+            .mode-item:last-child {{
+                margin-bottom: 0;
+            }}
+            .mode-swatch {{
+                width: 14px;
+                height: 14px;
+                border-radius: 3px;
+                border: 1px solid #546e7a;
+                display: inline-block;
+            }}
+            .mode-label {{
+                white-space: nowrap;
+            }}
+        </style>
+        <div id='mode-legend' class='mode-legend'>
+            <div class='mode-legend-title'>Modos de voo</div>
+            {items_html}
+        </div>
+        <script>
+            (function() {{
+                var legend = document.getElementById('mode-legend');
+                if (!legend) return;
+                var control = L.control({{position: 'bottomleft'}});
+                control.onAdd = function() {{ return legend; }};
+                control.addTo({self.map_js_name});
+            }})();
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
 
     def cleanup_cesium_html(self):
         if self.cesium_html_path and os.path.exists(self.cesium_html_path):
@@ -1784,6 +1852,8 @@ class TelemetryApp(QMainWindow):
         return samples
 
     def _build_cesium_mode_paths(self):
+        if not self._should_render_mode_colors():
+            return []
         segments = compute_mode_segments(self.df)
         paths = build_mode_path_segments(self.df, segments)
         result = []
@@ -1806,6 +1876,8 @@ class TelemetryApp(QMainWindow):
         return result
 
     def _build_mode_segments_for_timeline(self):
+        if not self._should_render_mode_colors():
+            return []
         segments = compute_mode_segments(self.df)
         mode_blocks = []
         for seg in segments:
