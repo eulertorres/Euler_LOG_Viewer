@@ -6,7 +6,6 @@ import sys
 import os
 import io
 import time
-import shutil
 import json
 import math
 from string import Template
@@ -44,12 +43,16 @@ from src.widgets.log_download_dialog import LogDownloadDialog
 from src.widgets.options_dialog import OptionsDialog
 from src.utils.gpu_utils import apply_best_gpu_env
 from src.utils.mode_utils import compute_mode_segments, build_mode_path_segments
+from src.utils.map_assets import MapAssetManager
 
 AIRCRAFT_ICON_PATH = resource_path('aircraft.svg')
 WIND_ICON_PATH = resource_path('seta.svg')
 LOADING_GIF_PATH = resource_path('gato.gif')
 DEFAULT_LOGS_DIR = get_logs_directory()
 
+# =========================
+# Diálogos auxiliares
+# =========================
 class LoadingDialog(QDialog):
     """Diálogo modal para exibir um GIF de carregamento."""
 
@@ -86,6 +89,9 @@ class LoadingDialog(QDialog):
             self.movie.stop()
 
 class TelemetryApp(QMainWindow):
+    # =========================
+    # Inicialização e recursos
+    # =========================
     def __init__(self):
         super().__init__()
         self.original_window_title = "SUPER VISUALIZADOR DE LOG DO EULER!! (～￣▽￣)～ - v0.2.3"
@@ -106,6 +112,7 @@ class TelemetryApp(QMainWindow):
 
         self.map_server = MapServer()
         self.map_server.start()
+        self.asset_manager = MapAssetManager(self.map_server)
         self.temp_map_file_path = ""
         self.map_js_name = ""
         self.map_is_ready = False 
@@ -166,8 +173,7 @@ class TelemetryApp(QMainWindow):
         self.wind_icon_filename = None
 
         self._register_static_assets()
-
-        self.copy_assets_to_server(self.cesium_plane_asset)
+        self.asset_manager.copy_asset(self.cesium_plane_asset)
 
         self.setup_ui()
 
@@ -175,35 +181,14 @@ class TelemetryApp(QMainWindow):
         self.log_download_dialog: LogDownloadDialog | None = None
 
     def _register_static_assets(self):
-        self.aircraft_icon_filename = self.copy_assets_to_server(AIRCRAFT_ICON_PATH)
-        self.wind_icon_filename = self.copy_assets_to_server(WIND_ICON_PATH)
+        """Copia ícones básicos para o servidor local e guarda os nomes dos arquivos."""
 
-    def copy_assets_to_server(self, icon_path):
-        """Copia arquivos estáticos necessários (ex: ícone) para o diretório do servidor."""
+        self.aircraft_icon_filename = self.asset_manager.copy_asset(AIRCRAFT_ICON_PATH)
+        self.wind_icon_filename = self.asset_manager.copy_asset(WIND_ICON_PATH)
 
-        try:
-            if not icon_path:
-                return None
-
-            source_icon_path = Path(icon_path)
-            if not source_icon_path.exists():
-                print(f"AVISO: Arquivo '{source_icon_path}' não encontrado. O ícone pode não aparecer.")
-                return None
-
-            dest_dir = Path(self.map_server.get_temp_dir())
-            if not dest_dir.exists():
-                print(f"ERRO: Diretório do servidor '{dest_dir}' não encontrado.")
-                return None
-
-            dest_path = dest_dir / source_icon_path.name
-            shutil.copy2(source_icon_path, dest_path)
-            return source_icon_path.name
-
-        except Exception as e:
-            print(f"ERRO CRÍTICO ao copiar assets para o servidor: {e}")
-            QMessageBox.warning(self, "Erro de Asset", f"Não foi possível copiar o ícone para o servidor:\n{e}")
-            return None
-        
+    # =========================
+    # Montagem da interface
+    # =========================
     def setup_ui(self):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -665,7 +650,9 @@ class TelemetryApp(QMainWindow):
             'hasModes': any(s.get('mode') is not None for s in valid_samples)
         }
 
-    # --- Funções do Mapa e Timeline ---
+    # =========================
+    # Funções do Mapa e Timeline
+    # =========================
     
     def on_map_load_finished(self, ok):
         if ok:
@@ -703,6 +690,7 @@ class TelemetryApp(QMainWindow):
         self._update_cesium_controls_state()
 
     def plot_map_route(self):
+        """Renderiza o mapa 2D via Folium usando ``self.df`` e atualiza o QWebEngineView."""
         if 'Latitude' not in self.df.columns or 'Longitude' not in self.df.columns:
             self.mapWidget.setHtml("<html><body><h1>Mas num tem dado GPS meu filho!!.</h1></body></html>"); return
         coords = self.df[['Latitude', 'Longitude']].dropna().values.tolist()
@@ -819,59 +807,12 @@ class TelemetryApp(QMainWindow):
         except Exception as e:
             print(f"ERRO ao criar ícone de vento: {e}"); self.wind_marker_js_name = "" # Reseta
 
-        # --- Função JS global para atualizar posição e rotação ---
-        js_update_function = f"""
-        <script>
-            // Garante que só define uma vez
-            if (typeof window.updateMarkers === 'undefined') {{
-                window.updateMarkers = function(lat, lon, aircraft_yaw, wind_dir, wind_speed) {{
-                    //console.log(`JS: updateMarkers called - Yaw: ${{aircraft_yaw}}, WindDir: ${{wind_dir}}`);
-                    var aircraftMarker = window[{repr(self.aircraft_marker_js_name)}];
-                    var windMarker = window[{repr(self.wind_marker_js_name)}];
-
-                    if (aircraftMarker && typeof aircraftMarker.setLatLng === 'function') {{
-                        var newLatLng = L.latLng(lat, lon);
-                        aircraftMarker.setLatLng(newLatLng);
-                        var aircraftImg = document.getElementById('aircraft-img');
-                        if (aircraftImg) {{
-                            // Assumindo SVG do avião aponta para CIMA
-                            aircraftImg.style.transform = 'rotate(' + aircraft_yaw + 'deg)';
-                        }}
-                    }} else {{
-                        //console.warn("JS: Marcador de avião não encontrado ou inválido.");
-                    }}
-
-                    if (windMarker && typeof windMarker.setLatLng === 'function') {{
-                        var newLatLngWind = L.latLng(lat, lon); // Mantem na mesma posição do avião
-                        windMarker.setLatLng(newLatLngWind);
-                        var windImg = document.getElementById('wind-arrow-img');
-                        if (windImg) {{
-                            // Rotação: wind_dir é DE ONDE VEM (0=Norte). Seta aponta PARA ONDE VAI.
-                            var windRotation = wind_dir;
-                            // var windRotation = 90;
-                            // windImg.style.transform = 'rotate(' + windRotation + 'deg)';
-
-                            // Opcional: Escala/Opacidade baseada na velocidade (WSI)
-                            // Exemplo simples de opacidade:
-                            var opacity = 0.8 + (Math.min(wind_speed, 20) / 20) * 0.7; // Escala opacidade de 0.3 a 1.0 para 0-20 m/s
-                            windImg.style.opacity = opacity.toFixed(2);
-
-                            // Exemplo simples de escala (pode ficar estranho):
-                            var scale = 0.7 + (Math.min(wind_speed, 15) / 15); // Escala tamanho de 70% a 120% para 0-15 m/s
-                            windImg.style.transform = 'rotate(' + windRotation + 'deg) scale(' + scale.toFixed(2) + ')';
-
-                        }} else {{
-                             console.warn("JS: Imagem #wind-arrow-img não encontrada.");
-                        }}
-                    }} else {{
-                        //console.warn("JS: Marcador de vento não encontrado ou inválido.");
-                    }}
-                }};
-                console.log("DEBUG JS: Função global updateMarkers(lat, lon, yaw, wind_dir, wind_speed) definida.");
-            }}
-        </script>
-        """
-        m.get_root().html.add_child(folium.Element(js_update_function))
+        map_script_path = self.asset_manager.render_map2d_script(
+            self.aircraft_marker_js_name,
+            self.wind_marker_js_name,
+        )
+        map_script_url = self.asset_manager.build_asset_url(map_script_path)
+        m.get_root().html.add_child(folium.Element(f"<script src='{map_script_url}'></script>"))
 
         temp_dir_str = self.map_server.get_temp_dir()
         self.temp_map_file_path = os.path.join(temp_dir_str, f"map_{time.time()}.html")
@@ -962,8 +903,10 @@ class TelemetryApp(QMainWindow):
                 self.cesium_follow_checkbox.blockSignals(False)
 
     def create_cesium_viewer_html(self):
+        """Cria o HTML principal do Cesium apontando para scripts externos gerados dinamicamente."""
+
         try:
-            self.copy_assets_to_server(self.cesium_plane_asset)
+            self.asset_manager.copy_asset(self.cesium_plane_asset)
             port = self.map_server.get_port()
             plane_url = f"http://127.0.0.1:{port}/{os.path.basename(self.cesium_plane_asset)}"
             plane_literal = json.dumps(plane_url)
@@ -971,6 +914,16 @@ class TelemetryApp(QMainWindow):
             default_imagery_key = json.dumps(self.current_cesium_imagery_key)
             samples_literal = json.dumps(self._build_cesium_samples())
             mode_paths_literal = json.dumps(self._build_cesium_mode_paths())
+
+            viewer_script_path = self.asset_manager.render_cesium_viewer_script(
+                plane_literal,
+                imagery_config_literal,
+                default_imagery_key,
+                samples_literal,
+                mode_paths_literal,
+            )
+            viewer_script_url = self.asset_manager.build_asset_url(viewer_script_path)
+
             html_template = Template("""<!DOCTYPE html>
 <html lang='pt-BR'>
 <head>
@@ -1020,298 +973,12 @@ class TelemetryApp(QMainWindow):
         <div><strong>Roll:</strong> <span id='hud-roll'>--</span>°</div>
     </div>
     <script src='https://cdn.jsdelivr.net/npm/cesium@1.121.0/Build/Cesium/Cesium.js'></script>
-    <script>
-        (function () {
-            const terrainProvider = new Cesium.EllipsoidTerrainProvider();
-            const viewer = new Cesium.Viewer('cesiumContainer', {
-                animation: false,
-                timeline: false,
-                shouldAnimate: false,
-                terrainProvider: terrainProvider,
-                imageryProvider: undefined,
-                baseLayerPicker: false,
-                sceneModePicker: false,
-                navigationHelpButton: false,
-                geocoder: false,
-                fullscreenButton: false,
-                homeButton: false,
-                infoBox: false,
-                selectionIndicator: false
-            });
-            viewer.scene.globe.enableLighting = true;
-            viewer.clock.shouldAnimate = false;
-            const imageryConfigsArray = $IMAGERY_CONFIG_JSON;
-            const imageryConfigs = imageryConfigsArray.reduce((acc, cfg) => {
-                acc[cfg.key] = cfg;
-                return acc;
-            }, {});
-            const defaultImageryKey = $DEFAULT_IMAGERY_KEY;
-            const samples = $SAMPLES_JSON;
-            const modePaths = $MODE_PATHS_JSON;
-            const sampleTimes = Array.isArray(samples)
-                ? samples.map(s => (s && Number.isFinite(s.timeMs)) ? s.timeMs : null)
-                : [];
-            const routePositions = Array.isArray(samples)
-                ? samples.map(s => (s && Number.isFinite(s.lat) && Number.isFinite(s.lon))
-                    ? { lat: s.lat, lon: s.lon, alt: Number.isFinite(s.alt) ? s.alt : 0.0 }
-                    : null)
-                : [];
-            let startJulian = undefined;
-            let stopJulian = undefined;
-            function buildTilingScheme(cfg) {
-                if (cfg.tilingScheme === 'geographic') {
-                    return new Cesium.GeographicTilingScheme();
-                }
-                return new Cesium.WebMercatorTilingScheme();
-            }
-            function createImageryProvider(cfg) {
-                return new Cesium.UrlTemplateImageryProvider({
-                    url: cfg.url,
-                    credit: cfg.credit || '',
-                    tilingScheme: buildTilingScheme(cfg),
-                    maximumLevel: Number.isFinite(cfg.maximumLevel) ? cfg.maximumLevel : undefined
-                });
-            }
-            function applyImageryLayer(key) {
-                const cfg = imageryConfigs[key] || imageryConfigs[defaultImageryKey];
-                if (!cfg) {
-                    return;
-                }
-                if (window.__currentBaseLayer) {
-                    viewer.imageryLayers.remove(window.__currentBaseLayer, true);
-                }
-                window.__currentBaseLayer = viewer.imageryLayers.addImageryProvider(
-                    createImageryProvider(cfg),
-                    0
-                );
-                return cfg;
-            }
-            applyImageryLayer(defaultImageryKey);
-            window.setImageryLayer = function(key) {
-                return applyImageryLayer(key);
-            };
-            const modePolylineCollection = viewer.scene.primitives.add(new Cesium.PolylineCollection());
-            function colorFromRgb(rgb, alpha) {
-                const r = Number.isFinite(rgb?.[0]) ? rgb[0] : 33;
-                const g = Number.isFinite(rgb?.[1]) ? rgb[1] : 150;
-                const b = Number.isFinite(rgb?.[2]) ? rgb[2] : 243;
-                return Cesium.Color.fromBytes(r, g, b, alpha ?? 200);
-            }
-            function toCartesianFromPoints(list) {
-                const arr = [];
-                for (const p of list || []) {
-                    if (!Number.isFinite(p?.lon) || !Number.isFinite(p?.lat)) continue;
-                    arr.push(p.lon, p.lat, Number.isFinite(p.alt) ? p.alt : 0.0);
-                }
-                return arr.length ? Cesium.Cartesian3.fromDegreesArrayHeights(arr) : [];
-            }
-            try {
-                if (Array.isArray(modePaths)) {
-                    modePaths.forEach(seg => {
-                        const positions = toCartesianFromPoints(seg?.points);
-                        if (positions.length >= 2) {
-                            modePolylineCollection.add({
-                                positions,
-                                width: 3,
-                                material: Cesium.Material.fromType('Color', {
-                                    color: colorFromRgb(seg?.color, 235)
-                                })
-                            });
-                        }
-                    });
-                }
-            } catch (err) {
-                console.error('Mode path render fallback', err);
-            }
-            const scratchHPR = new Cesium.HeadingPitchRoll();
-            const defaultPosition = Cesium.Cartesian3.fromDegrees(-47.9, -15.7, 1000.0);
-            const aircraftEntity = viewer.entities.add({
-                id: 'aircraft-model',
-                name: 'Aeronave',
-                position: defaultPosition,
-                model: {
-                    uri: $PLANE_LITERAL,
-                    minimumPixelSize: 80,
-                    maximumScale: 200,
-                    runAnimations: true
-                },
-                orientation: Cesium.Transforms.headingPitchRollQuaternion(
-                    defaultPosition,
-                    new Cesium.HeadingPitchRoll()
-                )
-            });
-            viewer.trackedEntity = aircraftEntity;
-            const hudLat = document.getElementById('hud-lat');
-            const hudLon = document.getElementById('hud-lon');
-            const hudAlt = document.getElementById('hud-alt');
-            const hudPitch = document.getElementById('hud-pitch');
-            const hudRoll = document.getElementById('hud-roll');
-            function updateHud(lat, lon, alt, pitchDeg, rollDeg) {
-                hudLat.textContent = Number.isFinite(lat) ? lat.toFixed(6) : '--';
-                hudLon.textContent = Number.isFinite(lon) ? lon.toFixed(6) : '--';
-                hudAlt.textContent = Number.isFinite(alt) ? alt.toFixed(1) : '--';
-                hudPitch.textContent = Number.isFinite(pitchDeg) ? pitchDeg.toFixed(1) : '--';
-                hudRoll.textContent = Number.isFinite(rollDeg) ? rollDeg.toFixed(1) : '--';
-            }
-            function radiansOrZero(valueDeg) {
-                return Cesium.Math.toRadians(Number.isFinite(valueDeg) ? valueDeg : 0.0);
-            }
-            const headingOffset = Cesium.Math.toRadians(-90.0);
-            function applySample(sample) {
-                if (!sample || !Number.isFinite(sample.lat) || !Number.isFinite(sample.lon)) {
-                    return;
-                }
-                const safeAlt = Number.isFinite(sample.alt) ? sample.alt : 0.0;
-                const position = Cesium.Cartesian3.fromDegrees(sample.lon, sample.lat, safeAlt);
-                aircraftEntity.position = position;
-                scratchHPR.heading = radiansOrZero(sample.heading) + headingOffset;
-                scratchHPR.pitch = radiansOrZero(sample.pitch);
-                scratchHPR.roll = radiansOrZero(sample.roll);
-                aircraftEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(position, scratchHPR);
-                updateHud(sample.lat, sample.lon, safeAlt, sample.pitch, sample.roll);
-            }
-            window.centerCameraOnAircraft = function() {
-                if (!aircraftEntity) {
-                    return;
-                }
-                if (window.__followEnabled !== false) {
-                    viewer.trackedEntity = aircraftEntity;
-                }
-                viewer.flyTo(aircraftEntity, {
-                    duration: 0.6,
-                    offset: new Cesium.HeadingPitchRange(0.0, -0.5, 150.0)
-                });
-            };
-            window.setFollowMode = function(enabled) {
-                window.__followEnabled = !!enabled;
-                viewer.trackedEntity = enabled ? aircraftEntity : undefined;
-            };
-            const completedPath = viewer.entities.add({
-                polyline: {
-                    positions: [],
-                    width: 4,
-                    material: new Cesium.PolylineGlowMaterialProperty({
-                        glowPower: 0.12,
-                        color: Cesium.Color.WHITE.withAlpha(0.95)
-                    })
-                }
-            });
-            const upcomingPath = viewer.entities.add({
-                polyline: {
-                    positions: [],
-                    width: 3,
-                    material: Cesium.Color.WHITE.withAlpha(0.25)
-                }
-            });
-            function toCartesian(pts) {
-                const arr = [];
-                for (const p of pts) {
-                    if (!p) continue;
-                    arr.push(p.lon, p.lat, p.alt);
-                }
-                return arr.length ? Cesium.Cartesian3.fromDegreesArrayHeights(arr) : [];
-            }
-            function updateRouteProgress(index) {
-                if (!Array.isArray(routePositions) || !routePositions.length) {
-                    return;
-                }
-                const clamped = Math.max(0, Math.min(routePositions.length, index + 1));
-                const done = routePositions.slice(0, clamped);
-                const nextSegment = routePositions.slice(Math.max(0, clamped - 1));
-                completedPath.polyline.positions = toCartesian(done);
-                upcomingPath.polyline.positions = toCartesian(nextSegment);
-            }
-            function julianFromMs(ms) {
-                return Cesium.JulianDate.fromDate(new Date(ms));
-            }
-            function findIndexForJulian(jd) {
-                if (!sampleTimes.length) return 0;
-                const currentMs = Cesium.JulianDate.toDate(jd).getTime();
-                for (let i = 0; i < sampleTimes.length; i++) {
-                    const t = sampleTimes[i];
-                    if (t === null) continue;
-                    const next = sampleTimes[Math.min(sampleTimes.length - 1, i + 1)];
-                    if (currentMs <= (next ?? currentMs)) {
-                        return i;
-                    }
-                }
-                return sampleTimes.length - 1;
-            }
-            function clampIndex(idx) {
-                return Math.max(0, Math.min(samples.length - 1, Number(idx) || 0));
-            }
-            let currentIndex = 0;
-            function applyIndex(idx) {
-                if (!Array.isArray(samples) || !samples.length) return;
-                const clamped = clampIndex(idx);
-                if (clamped === currentIndex && !viewer.clock.shouldAnimate) return;
-                currentIndex = clamped;
-                const sample = samples[clamped];
-                if (sample) {
-                    applySample(sample);
-                    if (window.__followEnabled !== false) {
-                        viewer.trackedEntity = aircraftEntity;
-                    }
-                }
-                updateRouteProgress(clamped);
-                window.__currentTimelineIndex = clamped;
-            }
-            window.setTimelineIndex = function(index) {
-                if (!sampleTimes.length) return;
-                const clamped = clampIndex(index);
-                const t = sampleTimes[clamped];
-                if (Number.isFinite(t)) {
-                    viewer.clock.shouldAnimate = false;
-                    viewer.clock.currentTime = julianFromMs(t);
-                    applyIndex(clamped);
-                }
-            };
-            if (Array.isArray(samples) && samples.length) {
-                const firstValidTime = sampleTimes.find(t => t !== null);
-                const lastValidTime = [...sampleTimes].reverse().find(t => t !== null);
-                if (Number.isFinite(firstValidTime) && Number.isFinite(lastValidTime)) {
-                    startJulian = julianFromMs(firstValidTime);
-                    stopJulian = julianFromMs(lastValidTime);
-                    viewer.clock.startTime = startJulian.clone();
-                    viewer.clock.stopTime = stopJulian.clone();
-                    viewer.clock.currentTime = startJulian.clone();
-                    viewer.clock.clockRange = Cesium.ClockRange.CLAMPED;
-                    viewer.clock.shouldAnimate = false;
-                }
-                const initialSample = samples.find(s => !!s);
-                if (initialSample) {
-                    const startPosition = Cesium.Cartesian3.fromDegrees(initialSample.lon, initialSample.lat, initialSample.alt || 0.0);
-                    aircraftEntity.position = startPosition;
-                    aircraftEntity.orientation = Cesium.Transforms.headingPitchRollQuaternion(
-                        startPosition,
-                        new Cesium.HeadingPitchRoll()
-                    );
-                }
-                viewer.trackedEntity = aircraftEntity;
-                window.__followEnabled = true;
-                viewer.clock.onTick.addEventListener(function(clock) {
-                    if (!sampleTimes.length) return;
-                    const idx = findIndexForJulian(clock.currentTime);
-                    if (idx !== currentIndex || clock.shouldAnimate) {
-                        applyIndex(idx);
-                    }
-                });
-            } else {
-                viewer.trackedEntity = aircraftEntity;
-                window.__followEnabled = true;
-            }
-            window.__cesiumViewerReady = true;
-        })();
-    </script>
-          </body>
-          </html>
-          """)
+    <script src='$VIEWER_SCRIPT_URL'></script>
+</body>
+</html>
+""")
             html_content = html_template.substitute(
-                PLANE_LITERAL=plane_literal,
-                IMAGERY_CONFIG_JSON=imagery_config_literal,
-                DEFAULT_IMAGERY_KEY=default_imagery_key,
-                SAMPLES_JSON=samples_literal,
-                MODE_PATHS_JSON=mode_paths_literal
+                VIEWER_SCRIPT_URL=viewer_script_url,
             )
             output_name = f"cesium_view_{int(time.time()*1000)}.html"
             output_path = os.path.join(self.map_server.get_temp_dir(), output_name)
@@ -1323,8 +990,13 @@ class TelemetryApp(QMainWindow):
             return ""
 
     def create_cesium_timeline_html(self):
+        """Gera o HTML da timeline 3D usando um script externo com os samples atuais."""
+
         try:
             samples_literal = json.dumps(self._build_cesium_samples())
+            timeline_script_path = self.asset_manager.render_cesium_timeline_script(samples_literal)
+            timeline_script_url = self.asset_manager.build_asset_url(timeline_script_path)
+
             html_template = Template("""<!DOCTYPE html>
     <html lang='pt-BR'>
     <head>
@@ -1358,105 +1030,20 @@ class TelemetryApp(QMainWindow):
     <body>
         <div id='timelineContainer'></div>
         <script src='https://cdn.jsdelivr.net/npm/cesium@1.121.0/Build/Cesium/Cesium.js'></script>
-        <script>
-            (function () {
-                const samples = $SAMPLES_JSON;
-                const sampleTimes = Array.isArray(samples)
-                    ? samples.map(s => (s && Number.isFinite(s.timeMs)) ? s.timeMs : null)
-                    : [];
-                const viewer = new Cesium.Viewer('timelineContainer', {
-                    animation: false,
-                    timeline: true,
-                    shouldAnimate: false,
-                    imageryProvider: false,
-                    baseLayerPicker: false,
-                    geocoder: false,
-                    sceneModePicker: false,
-                    navigationHelpButton: false,
-                    fullscreenButton: false,
-                    homeButton: false,
-                    infoBox: false,
-                    selectionIndicator: false
-                });
-                viewer.scene.canvas.style.display = 'none';
-                viewer.cesiumWidget.screenSpaceEventHandler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
-                function julianFromMs(ms) { return Cesium.JulianDate.fromDate(new Date(ms)); }
-                function clampIndex(idx) { return Math.max(0, Math.min(samples.length - 1, Number(idx) || 0)); }
-                function findIndexForJulian(jd) {
-                    if (!sampleTimes.length) return 0;
-                    const currentMs = Cesium.JulianDate.toDate(jd).getTime();
-                    for (let i = 0; i < sampleTimes.length; i++) {
-                        const t = sampleTimes[i];
-                        if (t === null) continue;
-                        const next = sampleTimes[Math.min(sampleTimes.length - 1, i + 1)];
-                        if (currentMs <= (next ?? currentMs)) { return i; }
-                    }
-                    return sampleTimes.length - 1;
-                }
-                function configureClock() {
-                    if (!sampleTimes.length) {
-                        if (viewer.timeline) {
-                            viewer.timeline.zoomTo(viewer.clock.startTime, viewer.clock.stopTime);
-                        }
-                        return;
-                    }
-                    const firstValidTime = sampleTimes.find(t => t !== null);
-                    const lastValidTime = [...sampleTimes].reverse().find(t => t !== null);
-                    if (Number.isFinite(firstValidTime) && Number.isFinite(lastValidTime)) {
-                        const start = julianFromMs(firstValidTime);
-                        const stop = julianFromMs(lastValidTime);
-                        viewer.clock.startTime = start.clone();
-                        viewer.clock.stopTime = stop.clone();
-                        viewer.clock.currentTime = start.clone();
-                        viewer.clock.clockRange = Cesium.ClockRange.CLAMPED;
-                        viewer.clock.shouldAnimate = false;
-                        if (viewer.timeline) {
-                            viewer.timeline.zoomTo(start, stop);
-                        }
-                    }
-                }
-                let currentIndex = 0;
-                window.__currentTimelineIndex = 0;
-                function applyIndex(idx) {
-                    if (!Array.isArray(samples) || !samples.length) return;
-                    const clamped = clampIndex(idx);
-                    if (clamped === currentIndex && !viewer.clock.shouldAnimate) return;
-                    currentIndex = clamped;
-                    window.__currentTimelineIndex = clamped;
-                }
-                viewer.clock.onTick.addEventListener(function(clock) {
-                    if (!sampleTimes.length) return;
-                    const idx = findIndexForJulian(clock.currentTime);
-                    if (idx !== currentIndex || clock.shouldAnimate) {
-                        applyIndex(idx);
-                    }
-                });
-                window.setTimelineIndex = function(index) {
-                    if (!sampleTimes.length) return;
-                    const clamped = clampIndex(index);
-                    const t = sampleTimes[clamped];
-                    if (Number.isFinite(t)) {
-                        viewer.clock.shouldAnimate = false;
-                        viewer.clock.currentTime = julianFromMs(t);
-                        applyIndex(clamped);
-                    }
-                };
-                configureClock();
-                window.__timelineReady = true;
-            })();
-        </script>
+        <script src='$TIMELINE_SCRIPT_URL'></script>
     </body>
     </html>
     """)
-            html_content = html_template.substitute(SAMPLES_JSON=samples_literal)
-            output_name = f"cesium_timeline_{int(time.time()*1000)}.html"
+            output_name = f"timeline_{int(time.time()*1000)}.html"
             output_path = os.path.join(self.map_server.get_temp_dir(), output_name)
+            html_content = html_template.substitute(TIMELINE_SCRIPT_URL=timeline_script_url)
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(html_content)
             return output_path
         except Exception as exc:
-            QMessageBox.warning(self, "Timeline", f"Não foi possível preparar a timeline: {exc}")
+            QMessageBox.warning(self, "Timeline 3D", f"Não foi possível preparar a timeline: {exc}")
             return ""
+
 
     def show_cesium_3d_view(self):
         self.cleanup_cesium_html()
